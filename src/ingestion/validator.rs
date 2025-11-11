@@ -35,6 +35,8 @@ fn normalize_relation(candidate: &LLMRelationCandidate) -> Result<NormalizedRela
     })
 }
 
+const MIN_CONFIDENCE: f32 = 0.8;
+
 pub fn validate_response(
     response: LLMExtractionResponse,
     fallback_label: &str,
@@ -46,7 +48,15 @@ pub fn validate_response(
 
     let mut relations = Vec::new();
     for relation in &response.relations {
-        relations.push(normalize_relation(relation)?);
+        let normalized = normalize_relation(relation)?;
+
+        if let Some(confidence) = normalized.confidence {
+            if confidence < MIN_CONFIDENCE {
+                continue;
+            }
+        }
+
+        relations.push(normalized);
     }
 
     Ok(ValidatedExtraction {

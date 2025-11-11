@@ -20,6 +20,8 @@ XLM Concept Graph est une plateforme d'apprentissage symbolique visant à constr
 
 L'ingestion s'appuie sur un modèle Qwen 3 exécuté via Ollama. Le client `OllamaLLMClient` dialogue directement avec l'API HTTP locale (`http://127.0.0.1:11434/api/generate`) en envoyant le prompt utilisateur et système puis en extrayant la portion JSON produite par le modèle de type "thinking".
 
+Pendant la validation, seules les relations dont la confiance est supérieure ou égale à `0.8` sont conservées. Les sorties du modèle peuvent donc contenir davantage d'hypothèses, mais seules celles jugées très fiables alimentent le graphe persistant.
+
 ## Relations supportées
 
 Les 20 relations canoniques couvrent les interactions physiques, logiques et sociales :

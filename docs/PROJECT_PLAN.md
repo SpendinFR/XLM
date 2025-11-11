@@ -26,7 +26,7 @@ Construire un système d'apprentissage symbolique centré sur 20 relations fonda
 3. **Pipeline d'ingestion**
    - Lecture des fichiers texte.
    - Génération de prompts standardisés décrivant les 20 relations.
-   - Validation et normalisation des sorties du LLM.
+   - Validation et normalisation des sorties du LLM (rejet des relations dont la confiance < 0,8).
    - Création/extension du graphe de connaissances.
 
 4. **Mémoire & Persistance**
