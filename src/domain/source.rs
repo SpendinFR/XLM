@@ -11,6 +11,12 @@ pub struct AssertionSource {
     pub prompt_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
