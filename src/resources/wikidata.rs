@@ -137,6 +137,7 @@ impl WikidataImporter {
 
         let client = HttpClient::builder()
             .default_headers(headers)
+            .timeout(Duration::from_secs(120))
             .build()
             .context("impossible de créer le client HTTP pour Wikidata")?;
 
