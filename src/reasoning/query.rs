@@ -1,7 +1,8 @@
 use crate::domain::{Concept, Relation, RelationKind};
 use crate::memory::KnowledgeGraph;
+use serde::Serialize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConceptRelations {
     pub concept: Concept,
     pub outgoing: Vec<Relation>,

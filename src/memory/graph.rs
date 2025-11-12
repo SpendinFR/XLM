@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct GraphData {
+pub struct GraphData {
     concepts: HashMap<Uuid, Concept>,
     relations: Vec<Relation>,
 }
