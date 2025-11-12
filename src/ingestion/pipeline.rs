@@ -96,6 +96,7 @@ impl<C: LLMClient> IngestionPipeline<C> {
                 llm_model: None,
                 prompt_hash: Some(prompt_hash.clone()),
                 llm_response: Some(serialized.clone()),
+                ..Default::default()
             };
 
             graph.add_relation(

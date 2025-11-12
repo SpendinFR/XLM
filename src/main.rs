@@ -2,11 +2,13 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use xlm::ingestion::{IngestionPipeline, OllamaLLMClient, PromptTemplate};
 use xlm::memory::{KnowledgeGraphLoader, KnowledgeGraphWriter};
 use xlm::reasoning::{PathExplainer, RelationQueryService};
+use xlm::resources::{WikidataImportConfig, WikidataImporter};
 use xlm::RelationKind;
 
 #[derive(Parser)]
@@ -55,6 +57,20 @@ enum Commands {
         graph: PathBuf,
         #[arg(long)]
         output: PathBuf,
+    },
+    Bootstrap {
+        #[arg(long)]
+        graph: PathBuf,
+        #[arg(long, default_value = "fr")]
+        language: String,
+        #[arg(long, default_value_t = 35_000)]
+        limit: usize,
+        #[arg(long, default_value_t = 500)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 250)]
+        pause_ms: u64,
+        #[arg(long, default_value = "https://query.wikidata.org/sparql")]
+        endpoint: String,
     },
 }
 
@@ -120,6 +136,32 @@ fn main() -> anyhow::Result<()> {
                 serde_json::to_string_pretty(&knowledge.snapshot())?,
             )?;
             info!("export" = %output.display());
+        }
+        Commands::Bootstrap {
+            graph,
+            language,
+            limit,
+            batch_size,
+            pause_ms,
+            endpoint,
+        } => {
+            let mut knowledge = KnowledgeGraphLoader::load_from_path(&graph)?;
+            let config = WikidataImportConfig::new(language)?
+                .with_max_records(limit)
+                .with_batch_size(batch_size)
+                .with_endpoint(endpoint)
+                .with_pause(Duration::from_millis(pause_ms));
+            let importer = WikidataImporter::new(config)?;
+            let stats = importer.import_into(&mut knowledge)?;
+            KnowledgeGraphWriter::save_to_path(&graph, &knowledge)?;
+            info!(
+                "import_lemmas" = stats.lemmas_added,
+                relations = stats.relations_added,
+                concepts = stats.concepts_created,
+                batches = stats.batches_processed,
+                elapsed_ms = stats.elapsed.as_millis() as u64,
+                "message" = "Import Wikidata terminé"
+            );
         }
     }
 

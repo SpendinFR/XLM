@@ -166,6 +166,19 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    pub fn has_relation(
+        &self,
+        subject: &ConceptId,
+        relation_kind: RelationKind,
+        object: &ConceptId,
+    ) -> bool {
+        self.data.relations.iter().any(|rel| {
+            rel.subject.uuid == subject.uuid
+                && rel.object.uuid == object.uuid
+                && rel.kind == relation_kind
+        })
+    }
+
     pub fn query_by_concept(&self, label: &str) -> Vec<QueryResult> {
         let Some(subject) = self.get_concept_by_label(label) else {
             return Vec::new();
