@@ -264,38 +264,20 @@ impl WikidataImporter {
     }
 
     fn fetch_batch(&self, limit: usize, offset: usize) -> Result<Vec<SenseRelationRecord>> {
-        let senses = self.fetch_senses(limit, offset)?;
-        if senses.is_empty() {
-            return Ok(Vec::new());
-        }
+        let query = self.build_query(limit, offset);
+        let response = self
+            .client
+            .post(&self.config.endpoint)
+            .body(query)
+            .send()
+            .context("échec lors de l'appel SPARQL à Wikidata")?
+            .error_for_status()
+            .context("réponse HTTP invalide depuis Wikidata")?;
 
-        let sense_lookup: HashMap<String, SenseEntry> = senses
-            .into_iter()
-            .map(|sense| (sense.sense_id.clone(), sense))
-            .collect();
-        let sense_entries: Vec<SenseEntry> = sense_lookup.values().cloned().collect();
-
-        let relations = self.fetch_relations(&sense_entries)?;
-
-        Ok(relations
-            .into_iter()
-            .filter_map(|relation| {
-                sense_lookup
-                    .get(&relation.sense_id)
-                    .map(|sense| sense.combine(relation))
-            })
-            .collect())
-    }
-
-    fn fetch_senses(&self, limit: usize, offset: usize) -> Result<Vec<SenseEntry>> {
-        let query = self.build_sense_query(limit, offset);
-        let response: SenseQueryResponse = self.execute_sparql(&query)?;
-        Ok(response
-            .results
-            .bindings
-            .into_iter()
-            .filter_map(|binding| binding.try_into().ok())
-            .collect())
+        let parsed: SparqlResponse = response
+            .json()
+            .context("impossible d'analyser la réponse SPARQL de Wikidata")?;
+        Ok(parsed.into_records())
     }
 
     fn fetch_relations(&self, senses: &[SenseEntry]) -> Result<Vec<RelationRow>> {
@@ -657,9 +639,9 @@ impl SenseRelationRecord {
             | RelationKind::PropertyEntity
             | RelationKind::MaterialObject
             | RelationKind::PartWhole
-            | RelationKind::InitialFinalState => ConceptKind::Abstract,
-            RelationKind::TimeEvent => ConceptKind::Abstract,
-            RelationKind::LocationEntity => ConceptKind::Abstract,
+            | RelationKind::InitialFinalState
+            | RelationKind::TimeEvent
+            | RelationKind::LocationEntity => ConceptKind::Abstract,
             RelationKind::CauseEffect
             | RelationKind::AgentAction
             | RelationKind::ActionObject
@@ -754,19 +736,28 @@ fn extract_entity_id(uri: &str) -> Option<&str> {
 
 fn infer_relation_kind(property_id: &str, property_label: Option<&str>) -> Option<RelationKind> {
     match property_id {
-        "P5137" | "P6593" | "P5975" | "P31" | "P279" => Some(RelationKind::CategoryInstance),
-        "P5973" | "P5976" | "P460" => Some(RelationKind::Similarity),
-        "P5974" | "P461" | "P1889" => Some(RelationKind::Opposition),
+        // Sense-level statements
+        "P5137" => Some(RelationKind::CategoryInstance),
+        "P5973" => Some(RelationKind::Similarity),
+        "P5974" => Some(RelationKind::Opposition),
+        "P5975" => Some(RelationKind::CategoryInstance),
+        "P5976" => Some(RelationKind::Opposition),
         "P5978" => Some(RelationKind::Condition),
-        "P6084" | "P276" | "P7153" => Some(RelationKind::LocationEntity),
-        "P366" | "P2283" => Some(RelationKind::FunctionUsage),
+        "P6084" => Some(RelationKind::LocationEntity),
+        "P6593" => Some(RelationKind::CategoryInstance),
+        // Item-level statements on the linked concept
+        "P31" | "P279" => Some(RelationKind::CategoryInstance),
         "P361" | "P527" => Some(RelationKind::PartWhole),
+        "P276" | "P7153" => Some(RelationKind::LocationEntity),
         "P585" | "P580" | "P582" => Some(RelationKind::TimeEvent),
         "P186" => Some(RelationKind::MaterialObject),
         "P127" => Some(RelationKind::Possession),
         "P828" | "P1542" => Some(RelationKind::CauseEffect),
+        "P366" | "P2283" => Some(RelationKind::FunctionUsage),
         "P3712" => Some(RelationKind::GoalAction),
         "P1552" => Some(RelationKind::PropertyEntity),
+        "P460" => Some(RelationKind::Similarity),
+        "P461" | "P1889" => Some(RelationKind::Opposition),
         _ => property_label
             .map(|label| label.to_lowercase())
             .and_then(|lower| match lower {
@@ -781,7 +772,8 @@ fn infer_relation_kind(property_id: &str, property_label: Option<&str>) -> Optio
                 value
                     if value.contains("antonym")
                         || value.contains("opposite")
-                        || value.contains("contraire") =>
+                        || value.contains("contraire")
+                        || value.contains("different") =>
                 {
                     Some(RelationKind::Opposition)
                 }
