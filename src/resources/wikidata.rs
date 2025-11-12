@@ -14,6 +14,41 @@ use crate::memory::KnowledgeGraph;
 const DEFAULT_ENDPOINT: &str = "https://query.wikidata.org/sparql";
 const DEFAULT_USER_AGENT: &str = "XLM-Concept-Graph/0.1 (+https://github.com/)";
 
+const SENSE_PROPERTY_IDS: &[&str] = &[
+    "P5137", // item for this sense
+    "P5972", // translation
+    "P5973", // synonym of sense
+    "P5974", // antonym of sense
+    "P5975", // troponym of sense
+    "P5976", // false friend of sense
+    "P5978", // classifier
+    "P6084", // location of sense usage
+    "P6593", // hypernym of sense
+];
+
+const ITEM_PROPERTY_IDS: &[&str] = &[
+    "P31",   // instance of
+    "P279",  // subclass of
+    "P361",  // part of
+    "P527",  // has part
+    "P276",  // location
+    "P7153", // significant place
+    "P585",  // point in time
+    "P580",  // start time
+    "P582",  // end time
+    "P186",  // made from material
+    "P127",  // owned by
+    "P828",  // has cause
+    "P1542", // has effect
+    "P366",  // has use
+    "P2283", // uses
+    "P3712", // has goal
+    "P1552", // has characteristic
+    "P460",  // said to be the same as
+    "P461",  // opposite of
+    "P1889", // different from
+];
+
 #[derive(Debug, Clone)]
 pub struct WikidataImportConfig {
     pub language_code: String,
@@ -124,8 +159,7 @@ impl WikidataImporter {
         while imported < self.config.max_records {
             let remaining = self.config.max_records - imported;
             let limit = remaining.min(self.config.batch_size);
-            let query = self.build_query(limit, offset);
-            let records = match self.fetch_batch(&query) {
+            let records = match self.fetch_batch(limit, offset) {
                 Ok(records) => records,
                 Err(err) => {
                     warn!("erreur" = %err, offset, "message" = "échec d'une requête Wikidata");
@@ -219,11 +253,12 @@ impl WikidataImporter {
         Ok(stats)
     }
 
-    fn fetch_batch(&self, query: &str) -> Result<Vec<SenseRelationRecord>> {
+    fn fetch_batch(&self, limit: usize, offset: usize) -> Result<Vec<SenseRelationRecord>> {
+        let query = self.build_query(limit, offset);
         let response = self
             .client
             .post(&self.config.endpoint)
-            .body(query.to_string())
+            .body(query)
             .send()
             .context("échec lors de l'appel SPARQL à Wikidata")?
             .error_for_status()
@@ -236,6 +271,17 @@ impl WikidataImporter {
     }
 
     fn build_query(&self, limit: usize, offset: usize) -> String {
+        let sense_properties = SENSE_PROPERTY_IDS
+            .iter()
+            .map(|id| format!("wdt:{}", id))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let item_properties = ITEM_PROPERTY_IDS
+            .iter()
+            .map(|id| format!("wdt:{}", id))
+            .collect::<Vec<_>>()
+            .join(" ");
+
         format!(
             r#"PREFIX dct: <http://purl.org/dc/terms/>
 PREFIX wikibase: <http://wikiba.se/ontology#>
@@ -249,11 +295,18 @@ WHERE {{
           wikibase:lemma ?lemma ;
           ontolex:sense ?sense .
   FILTER(LANG(?lemma) = "{language_code}")
-  ?sense ?prop ?target .
-  FILTER(STRSTARTS(STR(?prop), "http://www.wikidata.org/prop/direct/"))
-  BIND(STRAFTER(STR(?prop), "http://www.wikidata.org/prop/direct/") AS ?propertyId)
+  {{
+    ?sense ?propertyDirect ?target .
+    VALUES ?propertyDirect {{ {sense_properties} }}
+  }}
+  UNION
+  {{
+    ?sense wdt:P5137 ?item .
+    ?item ?propertyDirect ?target .
+    VALUES ?propertyDirect {{ {item_properties} }}
+  }}
+  BIND(STRAFTER(STR(?propertyDirect), "http://www.wikidata.org/prop/direct/") AS ?propertyId)
   BIND(IRI(CONCAT("http://www.wikidata.org/entity/", ?propertyId)) AS ?property)
-  FILTER(!isLiteral(?target))
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{language_code},en". }}
 }}
 ORDER BY ?lemma
@@ -262,6 +315,8 @@ OFFSET {offset}
 "#,
             language_qid = self.config.language_qid,
             language_code = self.config.language_code,
+            sense_properties = sense_properties,
+            item_properties = item_properties,
             limit = limit,
             offset = offset,
         )
@@ -333,7 +388,8 @@ impl TryFrom<SparqlBinding> for SenseRelationRecord {
         let sense_description = value.sense_description.map(|v| v.value);
         let property_id = value.property_id.value;
         let property_label = value.property_label.map(|v| v.value);
-        let target_id = extract_entity_id(&value.target.value).map(|id| id.to_string());
+        let target_raw = value.target.value;
+        let target_id = extract_entity_id(&target_raw).map(|id| id.to_string());
         let target_label = value.target_label.map(|v| v.value);
         let target_description = value.target_description.map(|v| v.value);
 
@@ -346,6 +402,7 @@ impl TryFrom<SparqlBinding> for SenseRelationRecord {
             sense_description,
             property_id,
             property_label,
+            target_raw,
             target_id,
             target_label,
             target_description,
@@ -363,6 +420,7 @@ struct SenseRelationRecord {
     sense_description: Option<String>,
     property_id: String,
     property_label: Option<String>,
+    target_raw: String,
     target_id: Option<String>,
     target_label: Option<String>,
     target_description: Option<String>,
@@ -376,7 +434,18 @@ impl SenseRelationRecord {
                 return Some(trimmed.to_string());
             }
         }
-        self.target_id.clone()
+        if let Some(id) = &self.target_id {
+            if !id.trim().is_empty() {
+                return Some(id.clone());
+            }
+        }
+
+        let raw = self.target_raw.trim();
+        if raw.is_empty() {
+            None
+        } else {
+            Some(raw.to_string())
+        }
     }
 
     fn relation_kind(&self) -> Option<RelationKind> {
@@ -396,9 +465,9 @@ impl SenseRelationRecord {
             | RelationKind::PropertyEntity
             | RelationKind::MaterialObject
             | RelationKind::PartWhole
-            | RelationKind::InitialFinalState => ConceptKind::Abstract,
-            RelationKind::TimeEvent => ConceptKind::Abstract,
-            RelationKind::LocationEntity => ConceptKind::Abstract,
+            | RelationKind::InitialFinalState
+            | RelationKind::TimeEvent
+            | RelationKind::LocationEntity => ConceptKind::Abstract,
             RelationKind::CauseEffect
             | RelationKind::AgentAction
             | RelationKind::ActionObject
@@ -419,7 +488,7 @@ impl SenseRelationRecord {
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
             });
-        let target = match (
+        let mut target = match (
             self.target_label
                 .as_deref()
                 .map(|value| value.trim())
@@ -431,6 +500,13 @@ impl SenseRelationRecord {
             (None, Some(id)) => Some(id.to_string()),
             _ => None,
         };
+
+        if target.is_none() {
+            let raw = self.target_raw.trim();
+            if !raw.is_empty() {
+                target = Some(raw.to_string());
+            }
+        }
 
         match (description, target) {
             (Some(description), Some(target)) => {
@@ -460,11 +536,29 @@ fn extract_entity_id(uri: &str) -> Option<&str> {
 
 fn infer_relation_kind(property_id: &str, property_label: Option<&str>) -> Option<RelationKind> {
     match property_id {
+        // Sense-level statements
         "P5137" => Some(RelationKind::CategoryInstance),
-        "P5971" | "P9444" | "P5257" => Some(RelationKind::PartWhole),
-        "P5972" | "P366" | "P2283" => Some(RelationKind::FunctionUsage),
-        "P6091" | "P7948" => Some(RelationKind::Similarity),
-        "P9987" | "P6887" | "P3831" => Some(RelationKind::CauseEffect),
+        "P5972" => Some(RelationKind::FunctionUsage),
+        "P5973" => Some(RelationKind::Similarity),
+        "P5974" => Some(RelationKind::Opposition),
+        "P5975" => Some(RelationKind::CategoryInstance),
+        "P5976" => Some(RelationKind::Similarity),
+        "P5978" => Some(RelationKind::Condition),
+        "P6084" => Some(RelationKind::LocationEntity),
+        "P6593" => Some(RelationKind::CategoryInstance),
+        // Item-level statements on the linked concept
+        "P31" | "P279" => Some(RelationKind::CategoryInstance),
+        "P361" | "P527" => Some(RelationKind::PartWhole),
+        "P276" | "P7153" => Some(RelationKind::LocationEntity),
+        "P585" | "P580" | "P582" => Some(RelationKind::TimeEvent),
+        "P186" => Some(RelationKind::MaterialObject),
+        "P127" => Some(RelationKind::Possession),
+        "P828" | "P1542" => Some(RelationKind::CauseEffect),
+        "P366" | "P2283" => Some(RelationKind::FunctionUsage),
+        "P3712" => Some(RelationKind::GoalAction),
+        "P1552" => Some(RelationKind::PropertyEntity),
+        "P460" => Some(RelationKind::Similarity),
+        "P461" | "P1889" => Some(RelationKind::Opposition),
         _ => property_label
             .map(|label| label.to_lowercase())
             .and_then(|lower| match lower {
@@ -479,7 +573,8 @@ fn infer_relation_kind(property_id: &str, property_label: Option<&str>) -> Optio
                 value
                     if value.contains("antonym")
                         || value.contains("opposite")
-                        || value.contains("contraire") =>
+                        || value.contains("contraire")
+                        || value.contains("different") =>
                 {
                     Some(RelationKind::Opposition)
                 }
@@ -674,5 +769,41 @@ mod tests {
         assert!(justification.contains("item for this sense"));
         assert!(justification.contains("Q146"));
         assert!(record.entity_url().contains("L123"));
+    }
+
+    #[test]
+    fn parse_literal_target() {
+        let json = r#"{
+            "results": {
+                "bindings": [
+                    {
+                        "lexeme": {"type": "uri", "value": "http://www.wikidata.org/entity/L999"},
+                        "lexemeLabel": {"type": "literal", "value": "date"},
+                        "lemma": {"type": "literal", "xml:lang": "fr", "value": "date"},
+                        "sense": {"type": "uri", "value": "http://www.wikidata.org/entity/L999-S1"},
+                        "senseLabel": {"type": "literal", "xml:lang": "fr", "value": "date (événement)"},
+                        "senseDescription": {"type": "literal", "xml:lang": "fr", "value": "marqueur temporel"},
+                        "property": {"type": "uri", "value": "http://www.wikidata.org/entity/P585"},
+                        "propertyId": {"type": "literal", "value": "P585"},
+                        "propertyLabel": {"type": "literal", "xml:lang": "en", "value": "point in time"},
+                        "target": {"type": "literal", "datatype": "http://www.w3.org/2001/XMLSchema#dateTime", "value": "2020-01-01T00:00:00Z"}
+                    }
+                ]
+            }
+        }"#;
+
+        let parsed: SparqlResponse = serde_json::from_str(json).unwrap();
+        let records = parsed.into_records();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.lemma, "date");
+        assert_eq!(record.property_id, "P585");
+        assert_eq!(
+            record.object_label().as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
+        let justification = record.build_justification().unwrap();
+        assert!(justification.contains("point in time"));
+        assert!(justification.contains("2020-01-01T00:00:00Z"));
     }
 }
