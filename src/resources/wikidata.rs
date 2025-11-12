@@ -54,6 +54,41 @@ const ITEM_PROPERTY_IDS: &[&str] = &[
     "P1889", // different from
 ];
 
+const SENSE_PROPERTY_IDS: &[&str] = &[
+    "P5137", // item for this sense
+    "P5972", // translation
+    "P5973", // synonym of sense
+    "P5974", // antonym of sense
+    "P5975", // troponym of sense
+    "P5976", // false friend of sense
+    "P5978", // classifier
+    "P6084", // location of sense usage
+    "P6593", // hypernym of sense
+];
+
+const ITEM_PROPERTY_IDS: &[&str] = &[
+    "P31",   // instance of
+    "P279",  // subclass of
+    "P361",  // part of
+    "P527",  // has part
+    "P276",  // location
+    "P7153", // significant place
+    "P585",  // point in time
+    "P580",  // start time
+    "P582",  // end time
+    "P186",  // made from material
+    "P127",  // owned by
+    "P828",  // has cause
+    "P1542", // has effect
+    "P366",  // has use
+    "P2283", // uses
+    "P3712", // has goal
+    "P1552", // has characteristic
+    "P460",  // said to be the same as
+    "P461",  // opposite of
+    "P1889", // different from
+];
+
 #[derive(Debug, Clone)]
 pub struct WikidataImportConfig {
     pub language_code: String,
@@ -280,77 +315,18 @@ impl WikidataImporter {
         Ok(parsed.into_records())
     }
 
-    fn fetch_relations(&self, senses: &[SenseEntry]) -> Result<Vec<RelationRow>> {
-        if senses.is_empty() {
-            return Ok(Vec::new());
-        }
+    fn build_query(&self, limit: usize, offset: usize) -> String {
+        let sense_properties = SENSE_PROPERTY_IDS
+            .iter()
+            .map(|id| format!("wdt:{}", id))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let item_properties = ITEM_PROPERTY_IDS
+            .iter()
+            .map(|id| format!("wdt:{}", id))
+            .collect::<Vec<_>>()
+            .join(" ");
 
-        let query = self.build_relation_query(senses);
-        let response: RelationQueryResponse = self.execute_sparql(&query)?;
-        Ok(response
-            .results
-            .bindings
-            .into_iter()
-            .filter_map(|binding| binding.try_into().ok())
-            .collect())
-    }
-
-    fn execute_sparql<T>(&self, query: &str) -> Result<T>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
-        let mut attempt = 0u32;
-
-        loop {
-            attempt += 1;
-
-            match self
-                .client
-                .post(&self.config.endpoint)
-                .body(query.to_string())
-                .send()
-            {
-                Ok(response) => {
-                    let status = response.status();
-                    if status.is_success() {
-                        return response
-                            .json()
-                            .context("impossible d'analyser la réponse SPARQL de Wikidata");
-                    }
-
-                    if should_retry_status(status) && attempt < MAX_FETCH_ATTEMPTS {
-                        warn!(
-                            attempt,
-                            status = status.as_u16(),
-                            "message" = "réponse HTTP non valide, nouvelle tentative"
-                        );
-                        sleep(retry_delay(attempt));
-                        continue;
-                    }
-
-                    return Err(anyhow!(
-                        "réponse HTTP invalide depuis Wikidata (statut {})",
-                        status
-                    ));
-                }
-                Err(err) => {
-                    if attempt < MAX_FETCH_ATTEMPTS {
-                        warn!(
-                            attempt,
-                            "message" = "erreur lors de l'appel SPARQL à Wikidata, nouvelle tentative",
-                            "erreur" = %err
-                        );
-                        sleep(retry_delay(attempt));
-                        continue;
-                    }
-
-                    return Err(anyhow!("échec lors de l'appel SPARQL à Wikidata: {err}"));
-                }
-            }
-        }
-    }
-
-    fn build_sense_query(&self, limit: usize, offset: usize) -> String {
         format!(
             r#"PREFIX dct: <http://purl.org/dc/terms/>
 PREFIX wikibase: <http://wikiba.se/ontology#>
@@ -363,6 +339,18 @@ WHERE {{
           wikibase:lemma ?lemma ;
           ontolex:sense ?sense .
   FILTER(LANG(?lemma) = "{language_code}")
+  {{
+    ?sense ?propertyDirect ?target .
+    VALUES ?propertyDirect {{ {sense_properties} }}
+  }}
+  UNION
+  {{
+    ?sense wdt:P5137 ?item .
+    ?item ?propertyDirect ?target .
+    VALUES ?propertyDirect {{ {item_properties} }}
+  }}
+  BIND(STRAFTER(STR(?propertyDirect), "http://www.wikidata.org/prop/direct/") AS ?propertyId)
+  BIND(IRI(CONCAT("http://www.wikidata.org/entity/", ?propertyId)) AS ?property)
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{language_code},en". }}
 }}
 ORDER BY ?lemma
@@ -371,6 +359,8 @@ OFFSET {offset}
 "#,
             language_qid = self.config.language_qid,
             language_code = self.config.language_code,
+            sense_properties = sense_properties,
+            item_properties = item_properties,
             limit = limit,
             offset = offset,
         )
@@ -551,18 +541,8 @@ impl TryFrom<RelationBinding> for RelationRow {
             .to_string();
         let property_id = value.property_id.value;
         let property_label = value.property_label.map(|v| v.value);
-        let (target_id, target_literal, target_datatype) = match value.target.value_type.as_str() {
-            "uri" => (
-                extract_entity_id(&value.target.value).map(|id| id.to_string()),
-                None,
-                None,
-            ),
-            _ => (
-                None,
-                Some(value.target.value.trim().to_string()),
-                value.target.datatype.clone(),
-            ),
-        };
+        let target_raw = value.target.value;
+        let target_id = extract_entity_id(&target_raw).map(|id| id.to_string());
         let target_label = value.target_label.map(|v| v.value);
         let target_description = value.target_description.map(|v| v.value);
 
@@ -570,6 +550,7 @@ impl TryFrom<RelationBinding> for RelationRow {
             sense_id,
             property_id,
             property_label,
+            target_raw,
             target_id,
             target_literal,
             target_datatype,
@@ -589,6 +570,7 @@ struct SenseRelationRecord {
     sense_description: Option<String>,
     property_id: String,
     property_label: Option<String>,
+    target_raw: String,
     target_id: Option<String>,
     target_literal: Option<String>,
     target_datatype: Option<String>,
@@ -609,17 +591,18 @@ impl SenseRelationRecord {
             }
             return Some((id.to_string(), None));
         }
-
-        if let Some(label) = self
-            .target_label
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
-            return Some((label.to_string(), None));
+        if let Some(id) = &self.target_id {
+            if !id.trim().is_empty() {
+                return Some(id.clone());
+            }
         }
 
-        self.formatted_literal().map(|literal| (literal, None))
+        let raw = self.target_raw.trim();
+        if raw.is_empty() {
+            None
+        } else {
+            Some(raw.to_string())
+        }
     }
 
     fn relation_kind(&self) -> Option<RelationKind> {
@@ -662,10 +645,25 @@ impl SenseRelationRecord {
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
             });
-        let target = self
-            .object_label_and_alias()
-            .map(|(label, _)| label)
-            .or_else(|| self.target_id.clone());
+        let mut target = match (
+            self.target_label
+                .as_deref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty()),
+            self.target_id.as_deref(),
+        ) {
+            (Some(label), Some(id)) => Some(format!("{} ({})", label, id)),
+            (Some(label), None) => Some(label.to_string()),
+            (None, Some(id)) => Some(id.to_string()),
+            _ => None,
+        };
+
+        if target.is_none() {
+            let raw = self.target_raw.trim();
+            if !raw.is_empty() {
+                target = Some(raw.to_string());
+            }
+        }
 
         match (description, target) {
             (Some(description), Some(target)) => {
@@ -738,10 +736,11 @@ fn infer_relation_kind(property_id: &str, property_label: Option<&str>) -> Optio
     match property_id {
         // Sense-level statements
         "P5137" => Some(RelationKind::CategoryInstance),
+        "P5972" => Some(RelationKind::FunctionUsage),
         "P5973" => Some(RelationKind::Similarity),
         "P5974" => Some(RelationKind::Opposition),
         "P5975" => Some(RelationKind::CategoryInstance),
-        "P5976" => Some(RelationKind::Opposition),
+        "P5976" => Some(RelationKind::Similarity),
         "P5978" => Some(RelationKind::Condition),
         "P6084" => Some(RelationKind::LocationEntity),
         "P6593" => Some(RelationKind::CategoryInstance),
@@ -1011,5 +1010,41 @@ mod tests {
         assert!(justification.contains("item for this sense"));
         assert!(justification.contains("Q146"));
         assert!(record.entity_url().contains("L123"));
+    }
+
+    #[test]
+    fn parse_literal_target() {
+        let json = r#"{
+            "results": {
+                "bindings": [
+                    {
+                        "lexeme": {"type": "uri", "value": "http://www.wikidata.org/entity/L999"},
+                        "lexemeLabel": {"type": "literal", "value": "date"},
+                        "lemma": {"type": "literal", "xml:lang": "fr", "value": "date"},
+                        "sense": {"type": "uri", "value": "http://www.wikidata.org/entity/L999-S1"},
+                        "senseLabel": {"type": "literal", "xml:lang": "fr", "value": "date (événement)"},
+                        "senseDescription": {"type": "literal", "xml:lang": "fr", "value": "marqueur temporel"},
+                        "property": {"type": "uri", "value": "http://www.wikidata.org/entity/P585"},
+                        "propertyId": {"type": "literal", "value": "P585"},
+                        "propertyLabel": {"type": "literal", "xml:lang": "en", "value": "point in time"},
+                        "target": {"type": "literal", "datatype": "http://www.w3.org/2001/XMLSchema#dateTime", "value": "2020-01-01T00:00:00Z"}
+                    }
+                ]
+            }
+        }"#;
+
+        let parsed: SparqlResponse = serde_json::from_str(json).unwrap();
+        let records = parsed.into_records();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.lemma, "date");
+        assert_eq!(record.property_id, "P585");
+        assert_eq!(
+            record.object_label().as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
+        let justification = record.build_justification().unwrap();
+        assert!(justification.contains("point in time"));
+        assert!(justification.contains("2020-01-01T00:00:00Z"));
     }
 }
