@@ -124,8 +124,7 @@ impl WikidataImporter {
         while imported < self.config.max_records {
             let remaining = self.config.max_records - imported;
             let limit = remaining.min(self.config.batch_size);
-            let query = self.build_query(limit, offset);
-            let records = match self.fetch_batch(&query) {
+            let records = match self.fetch_batch(limit, offset) {
                 Ok(records) => records,
                 Err(err) => {
                     warn!("erreur" = %err, offset, "message" = "échec d'une requête Wikidata");
@@ -219,11 +218,12 @@ impl WikidataImporter {
         Ok(stats)
     }
 
-    fn fetch_batch(&self, query: &str) -> Result<Vec<SenseRelationRecord>> {
+    fn fetch_batch(&self, limit: usize, offset: usize) -> Result<Vec<SenseRelationRecord>> {
+        let query = self.build_query(limit, offset);
         let response = self
             .client
             .post(&self.config.endpoint)
-            .body(query.to_string())
+            .body(query)
             .send()
             .context("échec lors de l'appel SPARQL à Wikidata")?
             .error_for_status()
@@ -396,9 +396,9 @@ impl SenseRelationRecord {
             | RelationKind::PropertyEntity
             | RelationKind::MaterialObject
             | RelationKind::PartWhole
-            | RelationKind::InitialFinalState => ConceptKind::Abstract,
-            RelationKind::TimeEvent => ConceptKind::Abstract,
-            RelationKind::LocationEntity => ConceptKind::Abstract,
+            | RelationKind::InitialFinalState
+            | RelationKind::TimeEvent
+            | RelationKind::LocationEntity => ConceptKind::Abstract,
             RelationKind::CauseEffect
             | RelationKind::AgentAction
             | RelationKind::ActionObject
@@ -460,11 +460,28 @@ fn extract_entity_id(uri: &str) -> Option<&str> {
 
 fn infer_relation_kind(property_id: &str, property_label: Option<&str>) -> Option<RelationKind> {
     match property_id {
+        // Sense-level statements
         "P5137" => Some(RelationKind::CategoryInstance),
-        "P5971" | "P9444" | "P5257" => Some(RelationKind::PartWhole),
-        "P5972" | "P366" | "P2283" => Some(RelationKind::FunctionUsage),
-        "P6091" | "P7948" => Some(RelationKind::Similarity),
-        "P9987" | "P6887" | "P3831" => Some(RelationKind::CauseEffect),
+        "P5973" => Some(RelationKind::Similarity),
+        "P5974" => Some(RelationKind::Opposition),
+        "P5975" => Some(RelationKind::CategoryInstance),
+        "P5976" => Some(RelationKind::Opposition),
+        "P5978" => Some(RelationKind::Condition),
+        "P6084" => Some(RelationKind::LocationEntity),
+        "P6593" => Some(RelationKind::CategoryInstance),
+        // Item-level statements on the linked concept
+        "P31" | "P279" => Some(RelationKind::CategoryInstance),
+        "P361" | "P527" => Some(RelationKind::PartWhole),
+        "P276" | "P7153" => Some(RelationKind::LocationEntity),
+        "P585" | "P580" | "P582" => Some(RelationKind::TimeEvent),
+        "P186" => Some(RelationKind::MaterialObject),
+        "P127" => Some(RelationKind::Possession),
+        "P828" | "P1542" => Some(RelationKind::CauseEffect),
+        "P366" | "P2283" => Some(RelationKind::FunctionUsage),
+        "P3712" => Some(RelationKind::GoalAction),
+        "P1552" => Some(RelationKind::PropertyEntity),
+        "P460" => Some(RelationKind::Similarity),
+        "P461" | "P1889" => Some(RelationKind::Opposition),
         _ => property_label
             .map(|label| label.to_lowercase())
             .and_then(|lower| match lower {
@@ -479,7 +496,8 @@ fn infer_relation_kind(property_id: &str, property_label: Option<&str>) -> Optio
                 value
                     if value.contains("antonym")
                         || value.contains("opposite")
-                        || value.contains("contraire") =>
+                        || value.contains("contraire")
+                        || value.contains("different") =>
                 {
                     Some(RelationKind::Opposition)
                 }
