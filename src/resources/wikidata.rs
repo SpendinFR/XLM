@@ -6,6 +6,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat};
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client as HttpClient;
+use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -15,6 +16,42 @@ use crate::memory::KnowledgeGraph;
 
 const DEFAULT_ENDPOINT: &str = "https://query.wikidata.org/sparql";
 const DEFAULT_USER_AGENT: &str = "XLM-Concept-Graph/0.1 (+https://github.com/)";
+const MAX_FETCH_ATTEMPTS: u32 = 4;
+const RETRY_BASE_DELAY_MS: u64 = 1_000;
+
+const SENSE_PROPERTY_IDS: &[&str] = &[
+    "P5137", // item for this sense
+    "P5973", // synonym of sense
+    "P5974", // antonym of sense
+    "P5975", // troponym of
+    "P5976", // false friend
+    "P5978", // classifier
+    "P6084", // location of sense usage
+    "P6593", // hypernym of sense
+];
+
+const ITEM_PROPERTY_IDS: &[&str] = &[
+    "P31",   // instance of
+    "P279",  // subclass of
+    "P361",  // part of
+    "P527",  // has part
+    "P276",  // location
+    "P7153", // significant place
+    "P585",  // point in time
+    "P580",  // start time
+    "P582",  // end time
+    "P186",  // made from material
+    "P127",  // owned by
+    "P828",  // has cause
+    "P1542", // has effect
+    "P366",  // has use
+    "P2283", // uses
+    "P3712", // has goal
+    "P1552", // has quality
+    "P460",  // said to be the same as
+    "P461",  // opposite of
+    "P1889", // different from
+];
 
 const SENSE_PROPERTY_IDS: &[&str] = &[
     "P5137", // item for this sense
@@ -261,19 +298,56 @@ impl WikidataImporter {
     }
 
     fn fetch_batch(&self, query: &str) -> Result<Vec<SenseRelationRecord>> {
-        let response = self
-            .client
-            .post(&self.config.endpoint)
-            .body(query.to_string())
-            .send()
-            .context("échec lors de l'appel SPARQL à Wikidata")?
-            .error_for_status()
-            .context("réponse HTTP invalide depuis Wikidata")?;
+        let mut attempt = 0u32;
 
-        let parsed: SparqlResponse = response
-            .json()
-            .context("impossible d'analyser la réponse SPARQL de Wikidata")?;
-        Ok(parsed.into_records())
+        loop {
+            attempt += 1;
+
+            match self
+                .client
+                .post(&self.config.endpoint)
+                .body(query.to_string())
+                .send()
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        let parsed: SparqlResponse = response
+                            .json()
+                            .context("impossible d'analyser la réponse SPARQL de Wikidata")?;
+                        return Ok(parsed.into_records());
+                    }
+
+                    if should_retry_status(status) && attempt < MAX_FETCH_ATTEMPTS {
+                        warn!(
+                            attempt,
+                            status = status.as_u16(),
+                            "message" = "réponse HTTP non valide, nouvelle tentative"
+                        );
+                        sleep(retry_delay(attempt));
+                        continue;
+                    }
+
+                    return Err(anyhow!(
+                        "réponse HTTP invalide depuis Wikidata (statut {})",
+                        status
+                    ));
+                }
+                Err(err) => {
+                    if attempt < MAX_FETCH_ATTEMPTS {
+                        warn!(
+                            attempt,
+                            "message" = "erreur lors de l'appel SPARQL à Wikidata, nouvelle tentative",
+                            "erreur" = %err
+                        );
+                        sleep(retry_delay(attempt));
+                        continue;
+                    }
+
+                    return Err(anyhow!("échec lors de l'appel SPARQL à Wikidata: {err}"));
+                }
+            }
+        }
     }
 
     fn build_query(&self, limit: usize, offset: usize) -> String {
@@ -316,6 +390,23 @@ OFFSET {offset}
             offset = offset,
         )
     }
+}
+
+fn should_retry_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::REQUEST_TIMEOUT
+            | StatusCode::INTERNAL_SERVER_ERROR
+    )
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    let step = 1u64 << (attempt.saturating_sub(1));
+    Duration::from_millis(RETRY_BASE_DELAY_MS.saturating_mul(step))
 }
 
 #[derive(Debug, Deserialize)]
