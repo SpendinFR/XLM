@@ -6,6 +6,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat};
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client as HttpClient;
+use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
 use reqwest::StatusCode;
 use serde::Deserialize;
