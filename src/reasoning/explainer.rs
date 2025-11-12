@@ -1,15 +1,16 @@
 use crate::domain::{Relation, RelationKind};
 use crate::memory::KnowledgeGraph;
+use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RelationDirection {
     Forward,
     Backward,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ExplanationNode {
     pub from: String,
     pub to: String,

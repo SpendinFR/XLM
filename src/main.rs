@@ -112,7 +112,7 @@ fn main() -> anyhow::Result<()> {
             } else if let Some(relations) = service.relations_for(&concept) {
                 println!("{}", serde_json::to_string_pretty(&relations)?);
             } else {
-                error!("concept introuvable", %concept);
+                error!(%concept, "concept introuvable");
             }
         }
         Commands::Explain {

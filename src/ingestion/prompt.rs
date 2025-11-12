@@ -26,19 +26,19 @@ impl PromptTemplate {
                 "Analyse le texte suivant et extrait toutes les relations pertinentes.\n",
                 "Relations autorisées :\n{}\n\n",
                 "Réponds avec un JSON de la forme :\\n",
-                "{",
+                "{{",
                 "  \"concept_label\": \"...\",",
                 "  \"relations\": [",
-                "    {",
+                "    {{",
                 "      \"subject\": \"...\",",
                 "      \"relation\": \"...\",",
                 "      \"object\": \"...\",",
                 "      \"confidence\": 0.0-1.0,",
                 "      \"justification\": \"phrase ou justification\"",
-                "    }",
+                "    }}",
                 "  ],",
                 "  \"notes\": \"observations supplémentaires\"",
-                "}"
+                "}}"
             ),
             relation_lines.join("\n")
         );
