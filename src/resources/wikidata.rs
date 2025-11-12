@@ -292,16 +292,16 @@ WHERE {{
           ontolex:sense ?sense .
   FILTER(LANG(?lemma) = "{language_code}")
   {{
-    VALUES ?property {{ {sense_properties} }}
-    ?sense ?property ?target .
+    VALUES ?propertyDirect {{ {sense_properties} }}
+    ?sense ?propertyDirect ?target .
   }}
   UNION
   {{
     ?sense wdt:P5137 ?item .
-    VALUES ?property {{ {item_properties} }}
-    ?item ?property ?target .
+    VALUES ?propertyDirect {{ {item_properties} }}
+    ?item ?propertyDirect ?target .
   }}
-  BIND(STRAFTER(STR(?property), "http://www.wikidata.org/prop/direct/") AS ?propertyId)
+  BIND(STRAFTER(STR(?propertyDirect), "http://www.wikidata.org/prop/direct/") AS ?propertyId)
   BIND(IRI(CONCAT("http://www.wikidata.org/entity/", ?propertyId)) AS ?property)
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{language_code},en". }}
 }}
