@@ -17,42 +17,7 @@ use crate::memory::KnowledgeGraph;
 
 const DEFAULT_ENDPOINT: &str = "https://query.wikidata.org/sparql";
 const DEFAULT_USER_AGENT: &str = "XLM-Concept-Graph/0.1 (+https://github.com/)";
-const MAX_FETCH_ATTEMPTS: u32 = 4;
-const RETRY_BASE_DELAY_MS: u64 = 1_000;
-
-const SENSE_PROPERTY_IDS: &[&str] = &[
-    "P5137", // item for this sense
-    "P5973", // synonym of sense
-    "P5974", // antonym of sense
-    "P5975", // troponym of
-    "P5976", // false friend
-    "P5978", // classifier
-    "P6084", // location of sense usage
-    "P6593", // hypernym of sense
-];
-
-const ITEM_PROPERTY_IDS: &[&str] = &[
-    "P31",   // instance of
-    "P279",  // subclass of
-    "P361",  // part of
-    "P527",  // has part
-    "P276",  // location
-    "P7153", // significant place
-    "P585",  // point in time
-    "P580",  // start time
-    "P582",  // end time
-    "P186",  // made from material
-    "P127",  // owned by
-    "P828",  // has cause
-    "P1542", // has effect
-    "P366",  // has use
-    "P2283", // uses
-    "P3712", // has goal
-    "P1552", // has quality
-    "P460",  // said to be the same as
-    "P461",  // opposite of
-    "P1889", // different from
-];
+const ITEM_QUERY_CHUNK_SIZE: usize = 25;
 
 const SENSE_PROPERTY_IDS: &[&str] = &[
     "P5137", // item for this sense
@@ -299,7 +264,31 @@ impl WikidataImporter {
     }
 
     fn fetch_batch(&self, limit: usize, offset: usize) -> Result<Vec<SenseRelationRecord>> {
-        let query = self.build_query(limit, offset);
+        let (mut records, contexts) = self.fetch_sense_batch(limit, offset)?;
+
+        if contexts.is_empty() {
+            return Ok(records);
+        }
+
+        let item_ids: Vec<String> = contexts.keys().cloned().collect();
+        for chunk in item_ids.chunks(ITEM_QUERY_CHUNK_SIZE) {
+            let item_rows = self.fetch_item_relations(chunk)?;
+            for row in item_rows {
+                if let Some(context) = contexts.get(&row.item_id) {
+                    records.push(row.into_record(context));
+                }
+            }
+        }
+
+        Ok(records)
+    }
+
+    fn fetch_sense_batch(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<SenseRelationRecord>, HashMap<String, SenseContext>)> {
+        let query = self.build_sense_query(limit, offset);
         let response = self
             .client
             .post(&self.config.endpoint)
@@ -312,16 +301,52 @@ impl WikidataImporter {
         let parsed: SparqlResponse = response
             .json()
             .context("impossible d'analyser la réponse SPARQL de Wikidata")?;
-        Ok(parsed.into_records())
+
+        let mut contexts: HashMap<String, SenseContext> = HashMap::new();
+        let mut records = Vec::new();
+
+        for record in parsed.into_records() {
+            if record.property_id == "P5137" {
+                if let Some(item_id) = record.target_id.clone() {
+                    contexts.entry(item_id).or_insert_with(|| SenseContext {
+                        lexeme_id: record.lexeme_id.clone(),
+                        lemma: record.lemma.clone(),
+                        lexeme_label: record.lexeme_label.clone(),
+                        sense_id: record.sense_id.clone(),
+                        sense_description: record.sense_description.clone(),
+                    });
+                }
+            }
+            records.push(record);
+        }
+
+        Ok((records, contexts))
     }
 
-    fn build_query(&self, limit: usize, offset: usize) -> String {
+    fn fetch_item_relations(&self, item_ids: &[String]) -> Result<Vec<ItemRelationRow>> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query = self.build_item_query(item_ids);
+        let response = self
+            .client
+            .post(&self.config.endpoint)
+            .body(query)
+            .send()
+            .context("échec lors de l'appel SPARQL à Wikidata")?
+            .error_for_status()
+            .context("réponse HTTP invalide depuis Wikidata")?;
+
+        let parsed: ItemSparqlResponse = response
+            .json()
+            .context("impossible d'analyser la réponse SPARQL de Wikidata pour les items")?;
+
+        Ok(parsed.into_rows())
+    }
+
+    fn build_sense_query(&self, limit: usize, offset: usize) -> String {
         let sense_properties = SENSE_PROPERTY_IDS
-            .iter()
-            .map(|id| format!("wdt:{}", id))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let item_properties = ITEM_PROPERTY_IDS
             .iter()
             .map(|id| format!("wdt:{}", id))
             .collect::<Vec<_>>()
@@ -339,16 +364,8 @@ WHERE {{
           wikibase:lemma ?lemma ;
           ontolex:sense ?sense .
   FILTER(LANG(?lemma) = "{language_code}")
-  {{
-    ?sense ?propertyDirect ?target .
-    VALUES ?propertyDirect {{ {sense_properties} }}
-  }}
-  UNION
-  {{
-    ?sense wdt:P5137 ?item .
-    ?item ?propertyDirect ?target .
-    VALUES ?propertyDirect {{ {item_properties} }}
-  }}
+  ?sense ?propertyDirect ?target .
+  VALUES ?propertyDirect {{ {sense_properties} }}
   BIND(STRAFTER(STR(?propertyDirect), "http://www.wikidata.org/prop/direct/") AS ?propertyId)
   BIND(IRI(CONCAT("http://www.wikidata.org/entity/", ?propertyId)) AS ?property)
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{language_code},en". }}
@@ -360,45 +377,39 @@ OFFSET {offset}
             language_qid = self.config.language_qid,
             language_code = self.config.language_code,
             sense_properties = sense_properties,
-            item_properties = item_properties,
             limit = limit,
             offset = offset,
         )
     }
 
-    fn build_relation_query(&self, senses: &[SenseEntry]) -> String {
-        let sense_values = senses
+    fn build_item_query(&self, item_ids: &[String]) -> String {
+        let item_values = item_ids
             .iter()
-            .map(|sense| format!("wd:{}", sense.sense_id))
+            .map(|id| format!("wd:{}", id))
             .collect::<Vec<_>>()
             .join(" ");
-        let sense_properties = sense_property_values();
-        let item_properties = item_property_values();
+        let property_values = ITEM_PROPERTY_IDS
+            .iter()
+            .map(|id| format!("wdt:{}", id))
+            .collect::<Vec<_>>()
+            .join(" ");
+
         format!(
             r#"PREFIX wikibase: <http://wikiba.se/ontology#>
 PREFIX wdt: <http://www.wikidata.org/prop/direct/>
 
-SELECT DISTINCT ?sense ?property ?propertyId ?propertyLabel ?target ?targetLabel ?targetDescription
+SELECT DISTINCT ?item ?property ?propertyId ?propertyLabel ?target ?targetLabel ?targetDescription
 WHERE {{
-  VALUES ?sense {{ {sense_values} }}
-  {{
-    VALUES ?propertyDirect {{ {sense_properties} }}
-    ?sense ?propertyDirect ?target .
-  }}
-  UNION
-  {{
-    ?sense wdt:P5137 ?item .
-    VALUES ?propertyDirect {{ {item_properties} }}
-    ?item ?propertyDirect ?target .
-  }}
+  VALUES ?item {{ {item_values} }}
+  ?item ?propertyDirect ?target .
+  VALUES ?propertyDirect {{ {property_values} }}
   BIND(STRAFTER(STR(?propertyDirect), "http://www.wikidata.org/prop/direct/") AS ?propertyId)
   BIND(IRI(CONCAT("http://www.wikidata.org/entity/", ?propertyId)) AS ?property)
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{language_code},en". }}
 }}
 "#,
-            sense_values = sense_values,
-            sense_properties = sense_properties,
-            item_properties = item_properties,
+            item_values = item_values,
+            property_values = property_values,
             language_code = self.config.language_code,
         )
     }
@@ -578,6 +589,107 @@ struct SenseRelationRecord {
     target_description: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SenseContext {
+    lexeme_id: String,
+    lemma: String,
+    lexeme_label: Option<String>,
+    sense_id: String,
+    sense_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemSparqlResponse {
+    results: ItemSparqlResults,
+}
+
+impl ItemSparqlResponse {
+    fn into_rows(self) -> Vec<ItemRelationRow> {
+        self.results
+            .bindings
+            .into_iter()
+            .filter_map(|binding| binding.try_into().ok())
+            .collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemSparqlResults {
+    bindings: Vec<ItemSparqlBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemSparqlBinding {
+    item: SparqlValue,
+    #[serde(rename = "property")]
+    _property_entity: Option<SparqlValue>,
+    #[serde(rename = "propertyId")]
+    property_id: SparqlValue,
+    #[serde(rename = "propertyLabel")]
+    property_label: Option<SparqlValue>,
+    target: SparqlValue,
+    #[serde(rename = "targetLabel")]
+    target_label: Option<SparqlValue>,
+    #[serde(rename = "targetDescription")]
+    target_description: Option<SparqlValue>,
+}
+
+impl TryFrom<ItemSparqlBinding> for ItemRelationRow {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ItemSparqlBinding) -> Result<Self> {
+        let item_id = extract_entity_id(&value.item.value)
+            .ok_or_else(|| anyhow!("identifiant d'item introuvable dans {}", value.item.value))?
+            .to_string();
+        let property_id = value.property_id.value;
+        let property_label = value.property_label.map(|v| v.value);
+        let target_raw = value.target.value;
+        let target_id = extract_entity_id(&target_raw).map(|id| id.to_string());
+        let target_label = value.target_label.map(|v| v.value);
+        let target_description = value.target_description.map(|v| v.value);
+
+        Ok(ItemRelationRow {
+            item_id,
+            property_id,
+            property_label,
+            target_raw,
+            target_id,
+            target_label,
+            target_description,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ItemRelationRow {
+    item_id: String,
+    property_id: String,
+    property_label: Option<String>,
+    target_raw: String,
+    target_id: Option<String>,
+    target_label: Option<String>,
+    target_description: Option<String>,
+}
+
+impl ItemRelationRow {
+    fn into_record(self, context: &SenseContext) -> SenseRelationRecord {
+        SenseRelationRecord {
+            lexeme_id: context.lexeme_id.clone(),
+            lemma: context.lemma.clone(),
+            lexeme_label: context.lexeme_label.clone(),
+            sense_id: context.sense_id.clone(),
+            _sense_label: None,
+            sense_description: context.sense_description.clone(),
+            property_id: self.property_id,
+            property_label: self.property_label,
+            target_raw: self.target_raw,
+            target_id: self.target_id,
+            target_label: self.target_label,
+            target_description: self.target_description,
+        }
+    }
+}
+
 impl SenseRelationRecord {
     fn object_label_and_alias(&self) -> Option<(String, Option<String>)> {
         if let Some(id) = &self.target_id {
@@ -590,6 +702,11 @@ impl SenseRelationRecord {
                 return Some((format!("{} ({})", label, id), Some(label.to_string())));
             }
             return Some((id.to_string(), None));
+        }
+        if let Some(id) = &self.target_id {
+            if !id.trim().is_empty() {
+                return Some(id.clone());
+            }
         }
         if let Some(id) = &self.target_id {
             if !id.trim().is_empty() {
