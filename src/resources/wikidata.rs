@@ -1,14 +1,11 @@
+
 use std::collections::{HashMap, HashSet};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat};
-
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client as HttpClient;
-use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
-use reqwest::StatusCode;
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -17,41 +14,32 @@ use crate::memory::KnowledgeGraph;
 
 const DEFAULT_ENDPOINT: &str = "https://query.wikidata.org/sparql";
 const DEFAULT_USER_AGENT: &str = "XLM-Concept-Graph/0.1 (+https://github.com/)";
-const ITEM_QUERY_CHUNK_SIZE: usize = 25;
 
-const SENSE_PROPERTY_IDS: &[&str] = &[
-    "P5137", // item for this sense
-    "P5972", // translation
-    "P5973", // synonym of sense
-    "P5974", // antonym of sense
-    "P5975", // troponym of sense
-    "P5976", // false friend of sense
-    "P5978", // classifier
-    "P6084", // location of sense usage
-    "P6593", // hypernym of sense
+/// Identifiants des propriétés à propager depuis l'item Q... (cible de P5137).
+const PROPAGATE_PIDS: &[&str] = &[
+    "P31",  // instance of
+    "P279", // subclass of
+    "P361", // part of
+    "P527", // has part
+    "P276", // location
+    "P7153",// significant place
+    "P186", // made from material
+    "P127", // owned by
+    "P460", // said to be the same as
+    "P461", // opposite of
+    "P1889",// different from
+    "P828", // has cause
+    "P1542",// has effect
+    "P366", // has use
+    "P2283",// uses
+    "P3712",// has goal
+    "P1552",// has characteristic
 ];
 
-const ITEM_PROPERTY_IDS: &[&str] = &[
-    "P31",   // instance of
-    "P279",  // subclass of
-    "P361",  // part of
-    "P527",  // has part
-    "P276",  // location
-    "P7153", // significant place
-    "P585",  // point in time
-    "P580",  // start time
-    "P582",  // end time
-    "P186",  // made from material
-    "P127",  // owned by
-    "P828",  // has cause
-    "P1542", // has effect
-    "P366",  // has use
-    "P2283", // uses
-    "P3712", // has goal
-    "P1552", // has characteristic
-    "P460",  // said to be the same as
-    "P461",  // opposite of
-    "P1889", // different from
+/// QIDs trop génériques à ignorer lors de la propagation (bruit).
+const SKIP_PROPAGATED_QIDS: &[&str] = &[
+    "Q111352", // lexeme — peu utile pour structurer tes données
+    // ajoute ici d'autres QIDs génériques si besoin (ex: "Q35120" concept ?) — laissé volontairement de côté
 ];
 
 #[derive(Debug, Clone)]
@@ -63,6 +51,8 @@ pub struct WikidataImportConfig {
     pub max_records: usize,
     pub pause: Duration,
     pub user_agent: String,
+    /// Propage des relations depuis l'item de P5137 (P31/P279 et autres PIDs choisis).
+    pub propagate_item_properties: bool,
 }
 
 impl WikidataImportConfig {
@@ -79,6 +69,7 @@ impl WikidataImportConfig {
             max_records: 35_000,
             pause: Duration::from_millis(250),
             user_agent: DEFAULT_USER_AGENT.to_string(),
+            propagate_item_properties: true, // activé par défaut
         })
     }
 
@@ -104,6 +95,11 @@ impl WikidataImportConfig {
 
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = user_agent.into();
+        self
+    }
+
+    pub fn with_propagate_item_properties(mut self, value: bool) -> Self {
+        self.propagate_item_properties = value;
         self
     }
 }
@@ -141,7 +137,6 @@ impl WikidataImporter {
 
         let client = HttpClient::builder()
             .default_headers(headers)
-            .timeout(Duration::from_secs(120))
             .build()
             .context("impossible de créer le client HTTP pour Wikidata")?;
 
@@ -150,6 +145,9 @@ impl WikidataImporter {
 
     pub fn import_into(&self, graph: &mut KnowledgeGraph) -> Result<ResourceImportStats> {
         let mut lemmas_seen: HashSet<String> = HashSet::new();
+        // cache des propriétés déjà récupérées pour un item Q...
+        let mut item_cache: HashMap<String, Vec<ItemProp>> = HashMap::new();
+
         let mut stats = ResourceImportStats {
             lemmas_added: 0,
             concepts_created: 0,
@@ -165,7 +163,8 @@ impl WikidataImporter {
         while imported < self.config.max_records {
             let remaining = self.config.max_records - imported;
             let limit = remaining.min(self.config.batch_size);
-            let records = match self.fetch_batch(limit, offset) {
+            let query = self.build_query(limit, offset);
+            let records = match self.fetch_batch(&query) {
                 Ok(records) => records,
                 Err(err) => {
                     warn!("erreur" = %err, offset, "message" = "échec d'une requête Wikidata");
@@ -193,6 +192,7 @@ impl WikidataImporter {
                     continue;
                 };
 
+                // Sujet = concept pour le lemme
                 let lemma_key = lemma.to_lowercase();
                 let existed = graph.get_concept_by_label(lemma).is_some();
                 let subject = graph.ensure_concept(lemma, ConceptKind::Entity);
@@ -201,6 +201,7 @@ impl WikidataImporter {
                     stats.concepts_created += 1;
                 }
 
+                // Alias éventuel
                 if let Some(alias) = record
                     .lexeme_label
                     .as_ref()
@@ -210,7 +211,8 @@ impl WikidataImporter {
                     graph.add_alias(&subject.id, alias.to_string());
                 }
 
-                let Some((object_label, object_alias)) = record.object_label_and_alias() else {
+                // Objet direct (depuis la ligne SPARQL principale)
+                let Some(object_label) = record.object_label() else {
                     continue;
                 };
                 let object_existed = graph.get_concept_by_label(&object_label).is_some();
@@ -220,10 +222,7 @@ impl WikidataImporter {
                     stats.concepts_created += 1;
                 }
 
-                if let Some(alias) = object_alias {
-                    graph.add_alias(&object.id, alias);
-                }
-
+                // Ajout de la relation directe
                 let already = graph.has_relation(&subject.id, relation_kind, &object.id);
                 let justification = record.build_justification();
                 let mut source = AssertionSource::default();
@@ -242,6 +241,77 @@ impl WikidataImporter {
 
                 if !already {
                     stats.relations_added += 1;
+                }
+
+                // === Propagation depuis l'item cible de P5137 =====================
+                if self.config.propagate_item_properties
+                    && record.property_id == "P5137"
+                    && record.target_id.is_some()
+                {
+                    let item_qid = record.target_id.as_ref().unwrap().clone(); // Qxxxx
+
+                    // Récupération (avec cache) des propriétés de l'item
+                    let props = if let Some(cached) = item_cache.get(&item_qid) {
+                        cached.clone()
+                    } else {
+                        match self.fetch_item_props(&item_qid) {
+                            Ok(v) => {
+                                item_cache.insert(item_qid.clone(), v.clone());
+                                v
+                            }
+                            Err(err) => {
+                                warn!(%item_qid, "échec de propagation depuis l'item: {}", err);
+                                Vec::new()
+                            }
+                        }
+                    };
+
+                    for ItemProp { pid, target_qid, target_label } in props {
+                        if SKIP_PROPAGATED_QIDS.contains(&target_qid.as_str()) {
+                            continue;
+                        }
+
+                        // Déduire le RelationKind pour ce pid
+                        let rk = match infer_relation_kind(&pid, Some(property_label_for(&pid))) {
+                            Some(kind) => kind,
+                            None => continue,
+                        };
+
+                        // Objet = classe/cible de l'item
+                        let label = target_label.clone().unwrap_or_else(|| target_qid.clone());
+                        let existed = graph.get_concept_by_label(&label).is_some();
+                        let obj_kind = SenseRelationRecord::fake_object_concept_kind(rk);
+                        let obj = graph.ensure_concept(&label, obj_kind);
+                        if !existed {
+                            stats.concepts_created += 1;
+                        }
+
+                        // Ajoute relation propagée (faible bruit)
+                        let already = graph.has_relation(&subject.id, rk, &obj.id);
+
+                        let justification = Some(format!(
+                            "{} — {} ({}) — propagé depuis l'item {} (item for this sense)",
+                            property_label_for(&pid), label, target_qid, item_qid
+                        ));
+
+                        let mut source = AssertionSource::default();
+                        source.dataset = Some("wikidata_lexeme_derived".to_string());
+                        source.external_id = Some(format!("{}#{}", record.lexeme_id, record.sense_id));
+                        source.url = Some(format!("https://www.wikidata.org/wiki/{}", item_qid));
+
+                        graph.add_relation(
+                            subject.clone(),
+                            rk,
+                            obj,
+                            Some(0.9),
+                            justification,
+                            source,
+                        )?;
+
+                        if !already {
+                            stats.relations_added += 1;
+                        }
+                    }
                 }
 
                 imported += 1;
@@ -263,36 +333,11 @@ impl WikidataImporter {
         Ok(stats)
     }
 
-    fn fetch_batch(&self, limit: usize, offset: usize) -> Result<Vec<SenseRelationRecord>> {
-        let (mut records, contexts) = self.fetch_sense_batch(limit, offset)?;
-
-        if contexts.is_empty() {
-            return Ok(records);
-        }
-
-        let item_ids: Vec<String> = contexts.keys().cloned().collect();
-        for chunk in item_ids.chunks(ITEM_QUERY_CHUNK_SIZE) {
-            let item_rows = self.fetch_item_relations(chunk)?;
-            for row in item_rows {
-                if let Some(context) = contexts.get(&row.item_id) {
-                    records.push(row.into_record(context));
-                }
-            }
-        }
-
-        Ok(records)
-    }
-
-    fn fetch_sense_batch(
-        &self,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<SenseRelationRecord>, HashMap<String, SenseContext>)> {
-        let query = self.build_sense_query(limit, offset);
+    fn fetch_batch(&self, query: &str) -> Result<Vec<SenseRelationRecord>> {
         let response = self
             .client
             .post(&self.config.endpoint)
-            .body(query)
+            .body(query.to_string())
             .send()
             .context("échec lors de l'appel SPARQL à Wikidata")?
             .error_for_status()
@@ -301,73 +346,28 @@ impl WikidataImporter {
         let parsed: SparqlResponse = response
             .json()
             .context("impossible d'analyser la réponse SPARQL de Wikidata")?;
-
-        let mut contexts: HashMap<String, SenseContext> = HashMap::new();
-        let mut records = Vec::new();
-
-        for record in parsed.into_records() {
-            if record.property_id == "P5137" {
-                if let Some(item_id) = record.target_id.clone() {
-                    contexts.entry(item_id).or_insert_with(|| SenseContext {
-                        lexeme_id: record.lexeme_id.clone(),
-                        lemma: record.lemma.clone(),
-                        lexeme_label: record.lexeme_label.clone(),
-                        sense_id: record.sense_id.clone(),
-                        sense_description: record.sense_description.clone(),
-                    });
-                }
-            }
-            records.push(record);
-        }
-
-        Ok((records, contexts))
+        Ok(parsed.into_records())
     }
 
-    fn fetch_item_relations(&self, item_ids: &[String]) -> Result<Vec<ItemRelationRow>> {
-        if item_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let query = self.build_item_query(item_ids);
-        let response = self
-            .client
-            .post(&self.config.endpoint)
-            .body(query)
-            .send()
-            .context("échec lors de l'appel SPARQL à Wikidata")?
-            .error_for_status()
-            .context("réponse HTTP invalide depuis Wikidata")?;
-
-        let parsed: ItemSparqlResponse = response
-            .json()
-            .context("impossible d'analyser la réponse SPARQL de Wikidata pour les items")?;
-
-        Ok(parsed.into_rows())
-    }
-
-    fn build_sense_query(&self, limit: usize, offset: usize) -> String {
-        let sense_properties = SENSE_PROPERTY_IDS
-            .iter()
-            .map(|id| format!("wdt:{}", id))
-            .collect::<Vec<_>>()
-            .join(" ");
-
+    fn build_query(&self, limit: usize, offset: usize) -> String {
         format!(
             r#"PREFIX dct: <http://purl.org/dc/terms/>
 PREFIX wikibase: <http://wikiba.se/ontology#>
-PREFIX ontolex: <http://www.wikidata.org/ns/lemon/ontolex#>
+PREFIX ontolex: <http://www.w3.org/ns/lemon/ontolex#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
 
-SELECT DISTINCT ?lexeme ?lexemeLabel ?lemma ?sense ?senseDescription
+SELECT DISTINCT ?lexeme ?lexemeLabel ?lemma ?sense ?senseLabel ?senseDescription ?property ?propertyId ?propertyLabel ?target ?targetLabel ?targetDescription
 WHERE {{
   ?lexeme a ontolex:LexicalEntry ;
           dct:language wd:{language_qid} ;
           wikibase:lemma ?lemma ;
           ontolex:sense ?sense .
   FILTER(LANG(?lemma) = "{language_code}")
-  ?sense ?propertyDirect ?target .
-  VALUES ?propertyDirect {{ {sense_properties} }}
-  BIND(STRAFTER(STR(?propertyDirect), "http://www.wikidata.org/prop/direct/") AS ?propertyId)
+  ?sense ?prop ?target .
+  FILTER(STRSTARTS(STR(?prop), "http://www.wikidata.org/prop/direct/"))
+  BIND(STRAFTER(STR(?prop), "http://www.wikidata.org/prop/direct/") AS ?propertyId)
   BIND(IRI(CONCAT("http://www.wikidata.org/entity/", ?propertyId)) AS ?property)
+  FILTER(!isLiteral(?target))
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{language_code},en". }}
 }}
 ORDER BY ?lemma
@@ -376,150 +376,94 @@ OFFSET {offset}
 "#,
             language_qid = self.config.language_qid,
             language_code = self.config.language_code,
-            sense_properties = sense_properties,
             limit = limit,
             offset = offset,
         )
     }
 
-    fn build_item_query(&self, item_ids: &[String]) -> String {
-        let item_values = item_ids
+    /// Récupère un grand éventail de propriétés de wd:Q... (cible de P5137).
+    fn fetch_item_props(&self, qid: &str) -> Result<Vec<ItemProp>> {
+        let joined = PROPAGATE_PIDS
             .iter()
-            .map(|id| format!("wd:{}", id))
+            .map(|pid| format!("wdt:{}", pid))
             .collect::<Vec<_>>()
             .join(" ");
-        let property_values = ITEM_PROPERTY_IDS
-            .iter()
-            .map(|id| format!("wdt:{}", id))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        format!(
-            r#"PREFIX wikibase: <http://wikiba.se/ontology#>
+        let query = format!(
+            r#"
 PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-
-SELECT DISTINCT ?item ?property ?propertyId ?propertyLabel ?target ?targetLabel ?targetDescription
-WHERE {{
-  VALUES ?item {{ {item_values} }}
-  ?item ?propertyDirect ?target .
-  VALUES ?propertyDirect {{ {property_values} }}
-  BIND(STRAFTER(STR(?propertyDirect), "http://www.wikidata.org/prop/direct/") AS ?propertyId)
-  BIND(IRI(CONCAT("http://www.wikidata.org/entity/", ?propertyId)) AS ?property)
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{language_code},en". }}
+PREFIX wd:  <http://www.wikidata.org/entity/>
+SELECT ?p ?target ?targetLabel ?targetDescription WHERE {{
+  VALUES ?p {{ {joined} }}
+  wd:{qid} ?p ?target .
+  FILTER(!isLiteral(?target))
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{language},en". }}
 }}
 "#,
-            item_values = item_values,
-            property_values = property_values,
-            language_code = self.config.language_code,
-        )
+            joined = joined,
+            qid = qid,
+            language = self.config.language_code
+        );
+
+        let response = self
+            .client
+            .post(&self.config.endpoint)
+            .body(query)
+            .send()
+            .context("échec lors de la récupération des propriétés de l'item")?
+            .error_for_status()
+            .context("réponse HTTP invalide depuis Wikidata (item props)")?;
+
+        let parsed: ItemPropResponse = response
+            .json()
+            .context("impossible d'analyser la réponse SPARQL (item props)")?;
+
+        let mut out = Vec::new();
+        for b in parsed.results.bindings {
+            let pid = extract_entity_id(&b.p.value).unwrap_or("").to_string(); // P31, ...
+            let target_qid = extract_entity_id(&b.target.value).unwrap_or("").to_string(); // Qxxxx
+            if pid.is_empty() || target_qid.is_empty() {
+                continue;
+            }
+            let target_label = b.target_label.map(|v| v.value);
+            out.push(ItemProp { pid, target_qid, target_label });
+        }
+        Ok(out)
     }
 }
 
-fn should_retry_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::REQUEST_TIMEOUT
-            | StatusCode::INTERNAL_SERVER_ERROR
-    )
+#[derive(Debug, Deserialize)]
+struct SparqlResponse {
+    results: SparqlResults,
 }
 
-fn retry_delay(attempt: u32) -> Duration {
-    let step = 1u64 << (attempt.saturating_sub(1));
-    Duration::from_millis(RETRY_BASE_DELAY_MS.saturating_mul(step))
+impl SparqlResponse {
+    fn into_records(self) -> Vec<SenseRelationRecord> {
+        self.results
+            .bindings
+            .into_iter()
+            .filter_map(|binding| binding.try_into().ok())
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
-struct SenseQueryResponse {
-    results: SenseQueryResults,
+struct SparqlResults {
+    bindings: Vec<SparqlBinding>,
 }
 
 #[derive(Debug, Deserialize)]
-struct SenseQueryResults {
-    bindings: Vec<SenseQueryBinding>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SenseQueryBinding {
+struct SparqlBinding {
     lexeme: SparqlValue,
     #[serde(rename = "lexemeLabel")]
     lexeme_label: Option<SparqlValue>,
     lemma: SparqlValue,
     sense: SparqlValue,
+    #[serde(rename = "senseLabel")]
+    sense_label: Option<SparqlValue>,
     #[serde(rename = "senseDescription")]
     sense_description: Option<SparqlValue>,
-}
-
-#[derive(Debug, Clone)]
-struct SenseEntry {
-    lexeme_id: String,
-    lemma: String,
-    lexeme_label: Option<String>,
-    sense_id: String,
-    sense_description: Option<String>,
-}
-
-impl TryFrom<SenseQueryBinding> for SenseEntry {
-    type Error = anyhow::Error;
-
-    fn try_from(value: SenseQueryBinding) -> Result<Self> {
-        let lexeme_id = extract_entity_id(&value.lexeme.value)
-            .ok_or_else(|| {
-                anyhow!(
-                    "identifiant de lexème introuvable dans {}",
-                    value.lexeme.value
-                )
-            })?
-            .to_string();
-        let sense_id = extract_entity_id(&value.sense.value)
-            .ok_or_else(|| anyhow!("identifiant de sens introuvable dans {}", value.sense.value))?
-            .to_string();
-        Ok(SenseEntry {
-            lexeme_id,
-            lemma: value.lemma.value,
-            lexeme_label: value.lexeme_label.map(|v| v.value),
-            sense_id,
-            sense_description: value.sense_description.map(|v| v.value),
-        })
-    }
-}
-
-impl SenseEntry {
-    fn combine(&self, relation: RelationRow) -> SenseRelationRecord {
-        SenseRelationRecord {
-            lexeme_id: self.lexeme_id.clone(),
-            lemma: self.lemma.clone(),
-            lexeme_label: self.lexeme_label.clone(),
-            sense_id: self.sense_id.clone(),
-            _sense_label: None,
-            sense_description: self.sense_description.clone(),
-            property_id: relation.property_id,
-            property_label: relation.property_label,
-            target_id: relation.target_id,
-            target_literal: relation.target_literal,
-            target_datatype: relation.target_datatype,
-            target_label: relation.target_label,
-            target_description: relation.target_description,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct RelationQueryResponse {
-    results: RelationQueryResults,
-}
-
-#[derive(Debug, Deserialize)]
-struct RelationQueryResults {
-    bindings: Vec<RelationBinding>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RelationBinding {
-    sense: SparqlValue,
+    #[serde(rename = "property")]
+    _property_entity: Option<SparqlValue>,
     #[serde(rename = "propertyId")]
     property_id: SparqlValue,
     #[serde(rename = "propertyLabel")]
@@ -531,40 +475,41 @@ struct RelationBinding {
     target_description: Option<SparqlValue>,
 }
 
-#[derive(Debug)]
-struct RelationRow {
-    sense_id: String,
-    property_id: String,
-    property_label: Option<String>,
-    target_id: Option<String>,
-    target_literal: Option<String>,
-    target_datatype: Option<String>,
-    target_label: Option<String>,
-    target_description: Option<String>,
-}
-
-impl TryFrom<RelationBinding> for RelationRow {
+impl TryFrom<SparqlBinding> for SenseRelationRecord {
     type Error = anyhow::Error;
 
-    fn try_from(value: RelationBinding) -> Result<Self> {
+    fn try_from(value: SparqlBinding) -> Result<Self> {
+        let lemma = value.lemma.value;
+        let lexeme_id = extract_entity_id(&value.lexeme.value)
+            .ok_or_else(|| {
+                anyhow!(
+                    "identifiant de lexème introuvable dans {}",
+                    value.lexeme.value
+                )
+            })?
+            .to_string();
         let sense_id = extract_entity_id(&value.sense.value)
             .ok_or_else(|| anyhow!("identifiant de sens introuvable dans {}", value.sense.value))?
             .to_string();
+        let lexeme_label = value.lexeme_label.map(|v| v.value);
+        let _sense_label = value.sense_label.map(|v| v.value);
+        let sense_description = value.sense_description.map(|v| v.value);
         let property_id = value.property_id.value;
         let property_label = value.property_label.map(|v| v.value);
-        let target_raw = value.target.value;
-        let target_id = extract_entity_id(&target_raw).map(|id| id.to_string());
+        let target_id = extract_entity_id(&value.target.value).map(|id| id.to_string());
         let target_label = value.target_label.map(|v| v.value);
         let target_description = value.target_description.map(|v| v.value);
 
-        Ok(RelationRow {
+        Ok(SenseRelationRecord {
+            lexeme_id,
+            lemma,
+            lexeme_label,
             sense_id,
+            _sense_label,
+            sense_description,
             property_id,
             property_label,
-            target_raw,
             target_id,
-            target_literal,
-            target_datatype,
             target_label,
             target_description,
         })
@@ -581,145 +526,20 @@ struct SenseRelationRecord {
     sense_description: Option<String>,
     property_id: String,
     property_label: Option<String>,
-    target_raw: String,
-    target_id: Option<String>,
-    target_literal: Option<String>,
-    target_datatype: Option<String>,
-    target_label: Option<String>,
-    target_description: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct SenseContext {
-    lexeme_id: String,
-    lemma: String,
-    lexeme_label: Option<String>,
-    sense_id: String,
-    sense_description: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ItemSparqlResponse {
-    results: ItemSparqlResults,
-}
-
-impl ItemSparqlResponse {
-    fn into_rows(self) -> Vec<ItemRelationRow> {
-        self.results
-            .bindings
-            .into_iter()
-            .filter_map(|binding| binding.try_into().ok())
-            .collect()
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ItemSparqlResults {
-    bindings: Vec<ItemSparqlBinding>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ItemSparqlBinding {
-    item: SparqlValue,
-    #[serde(rename = "property")]
-    _property_entity: Option<SparqlValue>,
-    #[serde(rename = "propertyId")]
-    property_id: SparqlValue,
-    #[serde(rename = "propertyLabel")]
-    property_label: Option<SparqlValue>,
-    target: SparqlValue,
-    #[serde(rename = "targetLabel")]
-    target_label: Option<SparqlValue>,
-    #[serde(rename = "targetDescription")]
-    target_description: Option<SparqlValue>,
-}
-
-impl TryFrom<ItemSparqlBinding> for ItemRelationRow {
-    type Error = anyhow::Error;
-
-    fn try_from(value: ItemSparqlBinding) -> Result<Self> {
-        let item_id = extract_entity_id(&value.item.value)
-            .ok_or_else(|| anyhow!("identifiant d'item introuvable dans {}", value.item.value))?
-            .to_string();
-        let property_id = value.property_id.value;
-        let property_label = value.property_label.map(|v| v.value);
-        let target_raw = value.target.value;
-        let target_id = extract_entity_id(&target_raw).map(|id| id.to_string());
-        let target_label = value.target_label.map(|v| v.value);
-        let target_description = value.target_description.map(|v| v.value);
-
-        Ok(ItemRelationRow {
-            item_id,
-            property_id,
-            property_label,
-            target_raw,
-            target_id,
-            target_label,
-            target_description,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct ItemRelationRow {
-    item_id: String,
-    property_id: String,
-    property_label: Option<String>,
-    target_raw: String,
     target_id: Option<String>,
     target_label: Option<String>,
     target_description: Option<String>,
-}
-
-impl ItemRelationRow {
-    fn into_record(self, context: &SenseContext) -> SenseRelationRecord {
-        SenseRelationRecord {
-            lexeme_id: context.lexeme_id.clone(),
-            lemma: context.lemma.clone(),
-            lexeme_label: context.lexeme_label.clone(),
-            sense_id: context.sense_id.clone(),
-            _sense_label: None,
-            sense_description: context.sense_description.clone(),
-            property_id: self.property_id,
-            property_label: self.property_label,
-            target_raw: self.target_raw,
-            target_id: self.target_id,
-            target_label: self.target_label,
-            target_description: self.target_description,
-        }
-    }
 }
 
 impl SenseRelationRecord {
-    fn object_label_and_alias(&self) -> Option<(String, Option<String>)> {
-        if let Some(id) = &self.target_id {
-            if let Some(label) = self
-                .target_label
-                .as_ref()
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-            {
-                return Some((format!("{} ({})", label, id), Some(label.to_string())));
-            }
-            return Some((id.to_string(), None));
-        }
-        if let Some(id) = &self.target_id {
-            if !id.trim().is_empty() {
-                return Some(id.clone());
+    fn object_label(&self) -> Option<String> {
+        if let Some(label) = &self.target_label {
+            let trimmed = label.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
             }
         }
-        if let Some(id) = &self.target_id {
-            if !id.trim().is_empty() {
-                return Some(id.clone());
-            }
-        }
-
-        let raw = self.target_raw.trim();
-        if raw.is_empty() {
-            None
-        } else {
-            Some(raw.to_string())
-        }
+        self.target_id.clone()
     }
 
     fn relation_kind(&self) -> Option<RelationKind> {
@@ -739,9 +559,39 @@ impl SenseRelationRecord {
             | RelationKind::PropertyEntity
             | RelationKind::MaterialObject
             | RelationKind::PartWhole
-            | RelationKind::InitialFinalState
-            | RelationKind::TimeEvent
-            | RelationKind::LocationEntity => ConceptKind::Abstract,
+            | RelationKind::InitialFinalState => ConceptKind::Abstract,
+            RelationKind::TimeEvent => ConceptKind::Abstract,
+            RelationKind::LocationEntity => ConceptKind::Abstract,
+            RelationKind::CauseEffect
+            | RelationKind::AgentAction
+            | RelationKind::ActionObject
+            | RelationKind::Opposition
+            | RelationKind::Dependence
+            | RelationKind::Possession => ConceptKind::Entity,
+        }
+    }
+
+    /// Variante "statique" pour l'objet lors des propagations (on n'a pas l'enregistrement complet).
+    fn fake_object_concept_kind(relation_kind: RelationKind) -> ConceptKind {
+        Self::object_concept_kind_for(relation_kind)
+    }
+
+    fn object_concept_kind_for(relation_kind: RelationKind) -> ConceptKind {
+        match relation_kind {
+            RelationKind::CategoryInstance
+            | RelationKind::FunctionUsage
+            | RelationKind::GoalAction
+            | RelationKind::ProcessResult
+            | RelationKind::Condition
+            | RelationKind::Similarity
+            | RelationKind::Comparison
+            | RelationKind::SocialConstruct
+            | RelationKind::PropertyEntity
+            | RelationKind::MaterialObject
+            | RelationKind::PartWhole
+            | RelationKind::InitialFinalState => ConceptKind::Abstract,
+            RelationKind::TimeEvent => ConceptKind::Abstract,
+            RelationKind::LocationEntity => ConceptKind::Abstract,
             RelationKind::CauseEffect
             | RelationKind::AgentAction
             | RelationKind::ActionObject
@@ -762,7 +612,7 @@ impl SenseRelationRecord {
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
             });
-        let mut target = match (
+        let target = match (
             self.target_label
                 .as_deref()
                 .map(|value| value.trim())
@@ -774,13 +624,6 @@ impl SenseRelationRecord {
             (None, Some(id)) => Some(id.to_string()),
             _ => None,
         };
-
-        if target.is_none() {
-            let raw = self.target_raw.trim();
-            if !raw.is_empty() {
-                target = Some(raw.to_string());
-            }
-        }
 
         match (description, target) {
             (Some(description), Some(target)) => {
@@ -795,251 +638,255 @@ impl SenseRelationRecord {
     fn entity_url(&self) -> String {
         format!("https://www.wikidata.org/wiki/{}", self.lexeme_id)
     }
-
-    fn formatted_literal(&self) -> Option<String> {
-        let literal = self.target_literal.as_ref()?.trim();
-        if literal.is_empty() {
-            return None;
-        }
-
-        if let Some(datatype) = self.target_datatype.as_deref() {
-            if datatype.ends_with("dateTime") {
-                if let Ok(parsed) = DateTime::parse_from_rfc3339(literal) {
-                    return Some(parsed.to_rfc3339_opts(SecondsFormat::Secs, true));
-                }
-                let normalized = literal.trim_start_matches('+');
-                if let Ok(parsed) = DateTime::parse_from_rfc3339(normalized) {
-                    return Some(parsed.to_rfc3339_opts(SecondsFormat::Secs, true));
-                }
-                if let Ok(parsed) = NaiveDateTime::parse_from_str(normalized, "%Y-%m-%dT%H:%M:%S") {
-                    return Some(parsed.format("%Y-%m-%dT%H:%M:%S").to_string());
-                }
-            } else if datatype.ends_with("date") {
-                let normalized = literal.trim_start_matches('+');
-                if let Ok(parsed) = DateTime::parse_from_rfc3339(normalized) {
-                    return Some(parsed.date_naive().format("%Y-%m-%d").to_string());
-                }
-                if let Ok(parsed) = NaiveDate::parse_from_str(normalized, "%Y-%m-%d") {
-                    return Some(parsed.format("%Y-%m-%d").to_string());
-                }
-                if normalized.len() >= 10 {
-                    return Some(normalized[..10].to_string());
-                }
-            } else if datatype.ends_with("gYear") {
-                return Some(literal.trim_start_matches('+').to_string());
-            }
-        }
-
-        Some(literal.to_string())
-    }
 }
 
 #[derive(Debug, Deserialize)]
 struct SparqlValue {
-    #[serde(rename = "type")]
-    value_type: String,
     value: String,
     #[serde(rename = "xml:lang", default)]
     _lang: Option<String>,
-    #[serde(default)]
-    datatype: Option<String>,
 }
 
 fn extract_entity_id(uri: &str) -> Option<&str> {
     uri.rsplit('/').next()
 }
 
+/// Table de correspondance (propriétés Wikidata -> RelationKind)
+/// - Ajouts : P5973, P5976 (Similarity) ; P5974, P461, P1889 (Opposition) ; P6593, P5975, P31, P279 (CategoryInstance)
+///   P5978 (Condition) ; P6084, P276, P7153 (LocationEntity) ; P361, P527 (PartWhole) ;
+///   P186 (MaterialObject) ; P127 (Possession) ; P460 (Similarity) ;
+///   P828, P1542 (CauseEffect) ; P3712 (GoalAction) ; P1552 (PropertyEntity).
+/// - Retirés : P6091, P7948, P9444, P5257.
 fn infer_relation_kind(property_id: &str, property_label: Option<&str>) -> Option<RelationKind> {
     match property_id {
-        // Sense-level statements
-        "P5137" => Some(RelationKind::CategoryInstance),
-        "P5972" => Some(RelationKind::FunctionUsage),
-        "P5973" => Some(RelationKind::Similarity),
-        "P5974" => Some(RelationKind::Opposition),
-        "P5975" => Some(RelationKind::CategoryInstance),
-        "P5976" => Some(RelationKind::Similarity),
-        "P5978" => Some(RelationKind::Condition),
-        "P6084" => Some(RelationKind::LocationEntity),
-        "P6593" => Some(RelationKind::CategoryInstance),
-        // Item-level statements on the linked concept
-        "P31" | "P279" => Some(RelationKind::CategoryInstance),
-        "P361" | "P527" => Some(RelationKind::PartWhole),
-        "P276" | "P7153" => Some(RelationKind::LocationEntity),
-        "P585" | "P580" | "P582" => Some(RelationKind::TimeEvent),
-        "P186" => Some(RelationKind::MaterialObject),
-        "P127" => Some(RelationKind::Possession),
-        "P828" | "P1542" => Some(RelationKind::CauseEffect),
-        "P366" | "P2283" => Some(RelationKind::FunctionUsage),
-        "P3712" => Some(RelationKind::GoalAction),
-        "P1552" => Some(RelationKind::PropertyEntity),
-        "P460" => Some(RelationKind::Similarity),
-        "P461" | "P1889" => Some(RelationKind::Opposition),
+        // === CategoryInstance ===================================================
+        "P5137" => Some(RelationKind::CategoryInstance), // item for this sense
+        "P6593" => Some(RelationKind::CategoryInstance), // hyperonym
+        "P5975" => Some(RelationKind::CategoryInstance), // troponym of
+        "P31"   => Some(RelationKind::CategoryInstance), // instance of
+        "P279"  => Some(RelationKind::CategoryInstance), // subclass of
+
+        // === PartWhole ==========================================================
+        "P5971" => Some(RelationKind::PartWhole), // (historique, conservé)
+        "P361"  => Some(RelationKind::PartWhole), // part of
+        "P527"  => Some(RelationKind::PartWhole), // has part
+
+        // === FunctionUsage ======================================================
+        "P5972" => Some(RelationKind::FunctionUsage), // (historique)
+        "P366"  => Some(RelationKind::FunctionUsage), // has use
+        "P2283" => Some(RelationKind::FunctionUsage), // uses
+
+        // === Similarity =========================================================
+        "P5973" => Some(RelationKind::Similarity), // synonym
+        "P5976" => Some(RelationKind::Similarity), // false friend
+        "P460"  => Some(RelationKind::Similarity), // said to be the same as
+
+        // === Opposition / Différence ============================================
+        "P5974" => Some(RelationKind::Opposition), // antonym
+        "P461"  => Some(RelationKind::Opposition), // opposite of
+        "P1889" => Some(RelationKind::Opposition), // different from
+
+        // === Condition ==========================================================
+        "P5978" => Some(RelationKind::Condition), // classifier (usage constraints)
+
+        // === LocationEntity =====================================================
+        "P6084" => Some(RelationKind::LocationEntity), // location of sense usage
+        "P276"  => Some(RelationKind::LocationEntity), // location
+        "P7153" => Some(RelationKind::LocationEntity), // significant place
+
+        // === MaterialObject =====================================================
+        "P186"  => Some(RelationKind::MaterialObject), // made from material
+
+        // === Possession =========================================================
+        "P127"  => Some(RelationKind::Possession), // owned by
+
+        // === CauseEffect ========================================================
+        "P828"  => Some(RelationKind::CauseEffect), // has cause
+        "P1542" => Some(RelationKind::CauseEffect), // has effect
+
+        // === GoalAction =========================================================
+        "P3712" => Some(RelationKind::GoalAction), // has goal
+
+        // === PropertyEntity =====================================================
+        "P1552" => Some(RelationKind::PropertyEntity), // has characteristic
+
+        // === Autres conservés de la table originale ============================
+        "P9987" | "P6887" | "P3831" => Some(RelationKind::CauseEffect),
+
+        // === Retirés (ne plus mapper) ==========================================
+        "P6091" | "P7948" | "P9444" | "P5257" => None,
+
+        // === Heuristiques sur les libellés =====================================
         _ => property_label
             .map(|label| label.to_lowercase())
-            .and_then(|lower| match lower {
-                value
-                    if value.contains("synonym")
-                        || value.contains("equivalent")
-                        || value.contains("variant")
-                        || value.contains("similar") =>
-                {
-                    Some(RelationKind::Similarity)
-                }
-                value
-                    if value.contains("antonym")
-                        || value.contains("opposite")
-                        || value.contains("contraire")
-                        || value.contains("different") =>
-                {
-                    Some(RelationKind::Opposition)
-                }
-                value
-                    if value.contains("hypernym")
-                        || value.contains("hyperonyme")
-                        || value.contains("superordinate")
-                        || value.contains("broader concept")
-                        || value.contains("is a") =>
-                {
-                    Some(RelationKind::CategoryInstance)
-                }
-                value
-                    if value.contains("hyponym")
-                        || value.contains("hyponyme")
-                        || value.contains("narrower concept")
-                        || value.contains("type of") =>
-                {
-                    Some(RelationKind::CategoryInstance)
-                }
-                value
-                    if value.contains("holonym")
-                        || value.contains("meronym")
-                        || value.contains("part of")
-                        || value.contains("composant")
-                        || value.contains("membre de") =>
-                {
-                    Some(RelationKind::PartWhole)
-                }
-                value
-                    if value.contains("used for")
-                        || value.contains("use")
-                        || value.contains("utilisé pour")
-                        || value.contains("purpose")
-                        || value.contains("fonction")
-                        || value.contains("usage") =>
-                {
-                    Some(RelationKind::FunctionUsage)
-                }
-                value
-                    if value.contains("requires")
-                        || value.contains("requires the condition")
-                        || value.contains("condition")
-                        || value.contains("nécessite") =>
-                {
-                    Some(RelationKind::Condition)
-                }
-                value
-                    if value.contains("depends on")
-                        || value.contains("dépend")
-                        || value.contains("needs") =>
-                {
-                    Some(RelationKind::Dependence)
-                }
-                value
-                    if value.contains("cause")
-                        || value.contains("causes")
-                        || value.contains("résultat")
-                        || value.contains("produces") =>
-                {
-                    Some(RelationKind::CauseEffect)
-                }
-                value
-                    if value.contains("result")
-                        || value.contains("produces")
-                        || value.contains("gives") =>
-                {
-                    Some(RelationKind::ProcessResult)
-                }
-                value
-                    if value.contains("agent")
-                        || value.contains("performed by")
-                        || value.contains("acteur") =>
-                {
-                    Some(RelationKind::AgentAction)
-                }
-                value
-                    if value.contains("object")
-                        || value.contains("patient")
-                        || value.contains("cible") =>
-                {
-                    Some(RelationKind::ActionObject)
-                }
-                value
-                    if value.contains("property")
-                        || value.contains("quality")
-                        || value.contains("characteristic") =>
-                {
-                    Some(RelationKind::PropertyEntity)
-                }
-                value
-                    if value.contains("location")
-                        || value.contains("lieu")
-                        || value.contains("place") =>
-                {
-                    Some(RelationKind::LocationEntity)
-                }
-                value
-                    if value.contains("time")
-                        || value.contains("moment")
-                        || value.contains("date") =>
-                {
-                    Some(RelationKind::TimeEvent)
-                }
-                value
-                    if value.contains("material")
-                        || value.contains("made of")
-                        || value.contains("matière") =>
-                {
-                    Some(RelationKind::MaterialObject)
-                }
-                value
-                    if value.contains("goal")
-                        || value.contains("purpose")
-                        || value.contains("objectif") =>
-                {
-                    Some(RelationKind::GoalAction)
-                }
-                value
-                    if value.contains("possession")
-                        || value.contains("owner")
-                        || value.contains("possède") =>
-                {
-                    Some(RelationKind::Possession)
-                }
-                value if value.contains("comparison") || value.contains("comparé à") => {
+            .and_then(|lower| match lower.as_str() {
+                // Similarité
+                v if v.contains("synonym")
+                    || v.contains("synonyme")
+                    || v.contains("equivalent")
+                    || v.contains("variant")
+                    || v.contains("similar")
+                    || v.contains("false friend")
+                    || v.contains("faux ami") => Some(RelationKind::Similarity),
+
+                // Opposition / différence
+                v if v.contains("antonym")
+                    || v.contains("antonyme")
+                    || v.contains("opposite")
+                    || v.contains("oppose")
+                    || v.contains("contraire")
+                    || v.contains("different from")
+                    || v.contains("différent de")
+                    || v.contains("contraste") => Some(RelationKind::Opposition),
+
+                // Catégorie / hyper-/hyponymie
+                v if v.contains("hypernym")
+                    || v.contains("hyperonyme")
+                    || v.contains("superordinate")
+                    || v.contains("broader concept")
+                    || v.contains("is a")
+                    || v.contains("instance of")
+                    || v.contains("subclass")
+                    || v.contains("troponym") => Some(RelationKind::CategoryInstance),
+
+                v if v.contains("hyponym")
+                    || v.contains("hyponyme")
+                    || v.contains("narrower concept")
+                    || v.contains("type of") => Some(RelationKind::CategoryInstance),
+
+                // Part–Whole
+                v if v.contains("holonym")
+                    || v.contains("meronym")
+                    || v.contains("part of")
+                    || v.contains("has part")
+                    || v.contains("composant")
+                    || v.contains("membre de") => Some(RelationKind::PartWhole),
+
+                // Usage / fonction
+                v if v.contains("used for")
+                    || v.contains("use")
+                    || v.contains("utilisé pour")
+                    || v.contains("purpose")
+                    || v.contains("fonction")
+                    || v.contains("usage")
+                    || v.contains("has use")
+                    || v.contains("uses") => Some(RelationKind::FunctionUsage),
+
+                // Condition / contrainte
+                v if v.contains("requires")
+                    || v.contains("requires the condition")
+                    || v.contains("condition")
+                    || v.contains("nécessite")
+                    || v.contains("classifier") => Some(RelationKind::Condition),
+
+                // Dépendance
+                v if v.contains("depends on")
+                    || v.contains("dépend")
+                    || v.contains("needs") => Some(RelationKind::Dependence),
+
+                // Cause / effet
+                v if v.contains("cause")
+                    || v.contains("causes")
+                    || v.contains("résultat")
+                    || v.contains("produces")
+                    || v.contains("has cause")
+                    || v.contains("has effect") => Some(RelationKind::CauseEffect),
+
+                // Résultat de processus
+                v if v.contains("result")
+                    || v.contains("produces")
+                    || v.contains("gives") => Some(RelationKind::ProcessResult),
+
+                // Agent / action / patient
+                v if v.contains("agent")
+                    || v.contains("performed by")
+                    || v.contains("acteur") => Some(RelationKind::AgentAction),
+                v if v.contains("object")
+                    || v.contains("patient")
+                    || v.contains("cible") => Some(RelationKind::ActionObject),
+
+                // Propriété / qualité
+                v if v.contains("property")
+                    || v.contains("quality")
+                    || v.contains("characteristic")
+                    || v.contains("has characteristic") => Some(RelationKind::PropertyEntity),
+
+                // Lieu
+                v if v.contains("location")
+                    || v.contains("lieu")
+                    || v.contains("place")
+                    || v.contains("significant place")
+                    || v.contains("location of sense usage") => Some(RelationKind::LocationEntity),
+
+                // Temps
+                v if v.contains("time")
+                    || v.contains("moment")
+                    || v.contains("date") => Some(RelationKind::TimeEvent),
+
+                // Matière / matériau
+                v if v.contains("material")
+                    || v.contains("made of")
+                    || v.contains("made from material")
+                    || v.contains("matière") => Some(RelationKind::MaterialObject),
+
+                // But
+                v if v.contains("goal")
+                    || v.contains("purpose")
+                    || v.contains("objectif")
+                    || v.contains("has goal") => Some(RelationKind::GoalAction),
+
+                // Possession
+                v if v.contains("possession")
+                    || v.contains("owner")
+                    || v.contains("owned by")
+                    || v.contains("possède") => Some(RelationKind::Possession),
+
+                // Comparaison
+                v if v.contains("comparison") || v.contains("comparé à") => {
                     Some(RelationKind::Comparison)
                 }
-                value if value.contains("social") || value.contains("institution") => {
+
+                // Constructions sociales
+                v if v.contains("social") || v.contains("institution") => {
                     Some(RelationKind::SocialConstruct)
                 }
+
                 _ => None,
             }),
     }
 }
 
-fn sense_property_values() -> String {
-    SENSE_PROPERTY_IDS
-        .iter()
-        .map(|id| format!("wdt:{}", id))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn item_property_values() -> String {
-    ITEM_PROPERTY_IDS
-        .iter()
-        .map(|id| format!("wdt:{}", id))
-        .collect::<Vec<_>>()
-        .join(" ")
+fn property_label_for(pid: &str) -> &'static str {
+    match pid {
+        "P5137" => "item for this sense",
+        "P6593" => "hyperonym",
+        "P5975" => "troponym of",
+        "P31" => "instance of",
+        "P279" => "subclass of",
+        "P5971" => "part-whole (legacy)",
+        "P361" => "part of",
+        "P527" => "has part",
+        "P5972" => "translation to sense (legacy)",
+        "P366" => "has use",
+        "P2283" => "uses",
+        "P5973" => "synonym",
+        "P5976" => "false friend",
+        "P460" => "said to be the same as",
+        "P5974" => "antonym",
+        "P461" => "opposite of",
+        "P1889" => "different from",
+        "P5978" => "classifier",
+        "P6084" => "location of sense usage",
+        "P276" => "location",
+        "P7153" => "significant place",
+        "P186" => "made from material",
+        "P127" => "owned by",
+        "P828" => "has cause",
+        "P1542" => "has effect",
+        "P3712" => "has goal",
+        "P1552" => "has characteristic",
+        _ => "property",
+    }
 }
 
 fn language_qid(code: &str) -> Option<&'static str> {
@@ -1053,115 +900,72 @@ fn language_qid(code: &str) -> Option<&'static str> {
     }
 }
 
+/// Propriété d'item (propagée) -> cible Q et label éventuel.
+#[derive(Clone, Debug)]
+struct ItemProp {
+    pid: String,            // "P31" etc.
+    target_qid: String,     // "Qxxxx"
+    target_label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemPropResponse {
+    results: ItemPropResults,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemPropResults {
+    bindings: Vec<ItemPropBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemPropBinding {
+    #[serde(rename = "p")]
+    p: SparqlValue,
+    #[serde(rename = "target")]
+    target: SparqlValue,
+    #[serde(rename = "targetLabel")]
+    target_label: Option<SparqlValue>,
+    #[serde(rename = "targetDescription")]
+    _target_description: Option<SparqlValue>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_sample_response() {
-        let sense_json = r#"{
-            "results": {
-                "bindings": [
-                    {
-                        "lexeme": {"type": "uri", "value": "http://www.wikidata.org/entity/L123"},
-                        "lexemeLabel": {"type": "literal", "value": "chat"},
-                        "lemma": {"type": "literal", "xml:lang": "fr", "value": "chat"},
-                        "sense": {"type": "uri", "value": "http://www.wikidata.org/entity/L123-S1"},
-                        "senseDescription": {"type": "literal", "xml:lang": "fr", "value": "animal domestique"}
-                    }
-                ]
-            }
-        }"#;
+    fn map_new_properties() {
+        // mappages ajoutés
+        assert_eq!(infer_relation_kind("P5973", Some("synonym")), Some(RelationKind::Similarity));
+        assert_eq!(infer_relation_kind("P5976", Some("false friend")), Some(RelationKind::Similarity));
+        assert_eq!(infer_relation_kind("P5974", Some("antonym")), Some(RelationKind::Opposition));
+        assert_eq!(infer_relation_kind("P6593", Some("hyperonym")), Some(RelationKind::CategoryInstance));
+        assert_eq!(infer_relation_kind("P5975", Some("troponym of")), Some(RelationKind::CategoryInstance));
+        assert_eq!(infer_relation_kind("P5978", Some("classifier")), Some(RelationKind::Condition));
+        assert_eq!(infer_relation_kind("P6084", Some("location of sense usage")), Some(RelationKind::LocationEntity));
+        assert_eq!(infer_relation_kind("P31", Some("instance of")), Some(RelationKind::CategoryInstance));
+        assert_eq!(infer_relation_kind("P279", Some("subclass of")), Some(RelationKind::CategoryInstance));
+        assert_eq!(infer_relation_kind("P361", Some("part of")), Some(RelationKind::PartWhole));
+        assert_eq!(infer_relation_kind("P527", Some("has part")), Some(RelationKind::PartWhole));
+        assert_eq!(infer_relation_kind("P276", Some("location")), Some(RelationKind::LocationEntity));
+        assert_eq!(infer_relation_kind("P7153", Some("significant place")), Some(RelationKind::LocationEntity));
+        assert_eq!(infer_relation_kind("P186", Some("made from material")), Some(RelationKind::MaterialObject));
+        assert_eq!(infer_relation_kind("P127", Some("owned by")), Some(RelationKind::Possession));
+        assert_eq!(infer_relation_kind("P461", Some("opposite of")), Some(RelationKind::Opposition));
+        assert_eq!(infer_relation_kind("P460", Some("said to be the same as")), Some(RelationKind::Similarity));
+        assert_eq!(infer_relation_kind("P1889", Some("different from")), Some(RelationKind::Opposition));
+        assert_eq!(infer_relation_kind("P828", Some("has cause")), Some(RelationKind::CauseEffect));
+        assert_eq!(infer_relation_kind("P1542", Some("has effect")), Some(RelationKind::CauseEffect));
+        assert_eq!(infer_relation_kind("P366", Some("has use")), Some(RelationKind::FunctionUsage));
+        assert_eq!(infer_relation_kind("P2283", Some("uses")), Some(RelationKind::FunctionUsage));
+        assert_eq!(infer_relation_kind("P3712", Some("has goal")), Some(RelationKind::GoalAction));
+        assert_eq!(infer_relation_kind("P1552", Some("has characteristic")), Some(RelationKind::PropertyEntity));
 
-        let sense_resp: SenseQueryResponse = serde_json::from_str(sense_json).unwrap();
-        let senses: Vec<SenseEntry> = sense_resp
-            .results
-            .bindings
-            .into_iter()
-            .map(|binding| binding.try_into().unwrap())
-            .collect();
-        assert_eq!(senses.len(), 1);
-        let sense = &senses[0];
-
-        let relation_json = r#"{
-            "results": {
-                "bindings": [
-                    {
-                        "sense": {"type": "uri", "value": "http://www.wikidata.org/entity/L123-S1"},
-                        "propertyId": {"type": "literal", "value": "P5137"},
-                        "propertyLabel": {"type": "literal", "xml:lang": "en", "value": "item for this sense"},
-                        "target": {"type": "uri", "value": "http://www.wikidata.org/entity/Q146"},
-                        "targetLabel": {"type": "literal", "xml:lang": "fr", "value": "chat"},
-                        "targetDescription": {"type": "literal", "xml:lang": "fr", "value": "animal domestique"}
-                    }
-                ]
-            }
-        }"#;
-
-        let relation_resp: RelationQueryResponse = serde_json::from_str(relation_json).unwrap();
-        let mut relations: Vec<RelationRow> = relation_resp
-            .results
-            .bindings
-            .into_iter()
-            .map(|binding| binding.try_into().unwrap())
-            .collect();
-        assert_eq!(relations.len(), 1);
-        let record = sense.combine(relations.remove(0));
-        assert_eq!(record.lemma, "chat");
-        assert_eq!(record.lexeme_id, "L123");
-        assert_eq!(record.sense_id, "L123-S1");
-        assert_eq!(record.property_id, "P5137");
-        assert_eq!(record.target_id.as_deref(), Some("Q146"));
-        let relation_kind = record.relation_kind().unwrap();
-        assert_eq!(relation_kind, RelationKind::CategoryInstance);
-        assert_eq!(
-            record.object_concept_kind(relation_kind),
-            ConceptKind::Abstract
-        );
-        let (label, alias) = record
-            .object_label_and_alias()
-            .expect("object label should exist");
-        assert_eq!(label, "chat (Q146)");
-        assert_eq!(alias.as_deref(), Some("chat"));
-        let justification = record.build_justification().unwrap();
-        assert!(justification.contains("item for this sense"));
-        assert!(justification.contains("Q146"));
-        assert!(record.entity_url().contains("L123"));
-    }
-
-    #[test]
-    fn parse_literal_target() {
-        let json = r#"{
-            "results": {
-                "bindings": [
-                    {
-                        "lexeme": {"type": "uri", "value": "http://www.wikidata.org/entity/L999"},
-                        "lexemeLabel": {"type": "literal", "value": "date"},
-                        "lemma": {"type": "literal", "xml:lang": "fr", "value": "date"},
-                        "sense": {"type": "uri", "value": "http://www.wikidata.org/entity/L999-S1"},
-                        "senseLabel": {"type": "literal", "xml:lang": "fr", "value": "date (événement)"},
-                        "senseDescription": {"type": "literal", "xml:lang": "fr", "value": "marqueur temporel"},
-                        "property": {"type": "uri", "value": "http://www.wikidata.org/entity/P585"},
-                        "propertyId": {"type": "literal", "value": "P585"},
-                        "propertyLabel": {"type": "literal", "xml:lang": "en", "value": "point in time"},
-                        "target": {"type": "literal", "datatype": "http://www.w3.org/2001/XMLSchema#dateTime", "value": "2020-01-01T00:00:00Z"}
-                    }
-                ]
-            }
-        }"#;
-
-        let parsed: SparqlResponse = serde_json::from_str(json).unwrap();
-        let records = parsed.into_records();
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record.lemma, "date");
-        assert_eq!(record.property_id, "P585");
-        assert_eq!(
-            record.object_label().as_deref(),
-            Some("2020-01-01T00:00:00Z")
-        );
-        let justification = record.build_justification().unwrap();
-        assert!(justification.contains("point in time"));
-        assert!(justification.contains("2020-01-01T00:00:00Z"));
+        // IDs retirés
+        assert_eq!(infer_relation_kind("P6091", Some("MGG Online ID")), None);
+        assert_eq!(infer_relation_kind("P7948", Some("GreatSchools ID")), None);
+        assert_eq!(infer_relation_kind("P9444", Some("CAOI person ID")), None);
+        assert_eq!(infer_relation_kind("P5257", Some("identifiant taxonomique")), None);
     }
 }
